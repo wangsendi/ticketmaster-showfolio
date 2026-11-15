@@ -1,0 +1,56 @@
+# Dependencies, runtime state and local history
+node_modules/
+/data/
+/output/
+/reports/
+/exports/
+/downloads/
+/screenshots/
+/browser-profiles/
+/.playwright-cli/
+/PROVENANCE.json
+
+# Local proxy/settings files; only reviewed examples belong in Git
+/config/*
+!/config/*.example.json
+.env
+.env.*
+!.env.example
+
+# Accounts, exports, screenshots and browser/session evidence
+*.txt
+!requirements.txt
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.zip
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.har
+*.log
+*.trace
+*.sqlite*
+*.db
+*.db-*
+*cookie*.json
+*storage-state*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Tool caches and editor files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+.DS_Store
+.idea/
+.vscode/
+*.tmp

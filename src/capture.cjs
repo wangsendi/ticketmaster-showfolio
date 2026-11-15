@@ -1,0 +1,30 @@
+"use strict";
+
+async function capturePage(page, filename, checkStopped = () => {}) {
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  await page.evaluate(() => document.fonts.ready);
+  let previousHeight = 0;
+  for (let pass = 0; pass < 3; pass++) {
+    const height = await page.evaluate(() => document.documentElement.scrollHeight);
+    if (height > 50000) throw new Error("Page exceeds full screenshot height limit");
+    for (let y = 0; y < height; y += 800) {
+      checkStopped();
+      await page.evaluate(y => window.scrollTo(0, y), y);
+      await wait(120);
+    }
+    await page.evaluate(() => Promise.all(Array.from(document.images).map(img =>
+      img.complete ? Promise.resolve() : Promise.race([
+        new Promise(resolve => { img.addEventListener("load", resolve, { once: true }); img.addEventListener("error", resolve, { once: true }); }),
+        new Promise(resolve => setTimeout(resolve, 5000))
+      ]))));
+    if (height === previousHeight) break;
+    previousHeight = height;
+  }
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await wait(500);
+  checkStopped();
+  const png = await page.screenshot({ path: filename, fullPage: true, animations: "disabled", timeout: 30000 });
+  return { screenshotFullPage: true, screenshotWidth: png.readUInt32BE(16), screenshotHeight: png.readUInt32BE(20) };
+}
+
+module.exports = { capturePage };

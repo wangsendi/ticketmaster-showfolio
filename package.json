@@ -1,0 +1,22 @@
+{
+  "name": "ticketmaster-showfolio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local account and event-selection workbench with SQLite storage and screenshot exports",
+  "scripts": {
+    "start": "python3 web.py",
+    "check": "xvfb-run -a node src/preflight.cjs",
+    "test": "python3 -m unittest discover -s tests && node --test tests/*.test.cjs",
+    "install:chromium": "playwright install chromium",
+    "install:firefox": "playwright install firefox",
+    "install:cloakbrowser": "node src/install-cloakbrowser.cjs"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "dependencies": {
+    "cloakbrowser": "0.6.5",
+    "playwright": "1.63.0",
+    "playwright-core": "1.63.0"
+  }
+}
