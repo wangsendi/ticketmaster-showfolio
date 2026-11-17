@@ -1,12 +1,11 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const PAGE_SIZE = 100;
-const MAX_ATTEMPTS = Number(document.documentElement.dataset.maxAttempts) || 3;
 const failedStatuses = new Set(["failed", "partial", "interrupted"]);
 const token = document.querySelector('meta[name="app-token"]').content;
 const state = { batches: [], batch: null, runs: [], filter: "all", page: 1, detail: null, refreshing: false, proxies: null, exports: {} };
 const statusNames = { draft: "待开始", pending: "等待查询", running: "查询中", success: "已完成", partial: "结果不完整", failed: "查询失败", "needs-human": "需人工验证", cancelled: "已停止", interrupted: "已中断", complete: "已结束" };
-const stageNames = { refresh_proxies: "更新代理名单", retry_queued: "等待重试", retry_wait: "等待更换代理重试", setup: "准备代理", service: "查询服务异常", launch: "启动浏览器", proxy_setup: "连接代理", campaign: "打开活动", official_sign_in: "打开登录", wait_email: "等待邮箱页面", wait_recaptcha_before_email: "等待验证加载", email_once: "提交邮箱", password_once: "提交密码", wait_recaptcha_initialization: "等待验证加载", wait_exchange: "等待登录回调", wait_com_return: "返回活动页面", readonly_com_fan: "读取报名记录", capture_page: "生成整页截图", browser_driver: "浏览器驱动崩溃", browser_process: "浏览器进程异常", complete: "查询结束", runner: "查询进程异常", timeout: "查询超时" };
+const stageNames = { refresh_proxies: "更新代理名单", wait_proxy: "等待空闲出口 IP", retry_queued: "等待重试", retry_wait: "等待更换代理重试", setup: "准备代理", service: "查询服务异常", launch: "启动浏览器", proxy_setup: "连接代理", campaign: "打开活动", official_sign_in: "打开登录", wait_email: "等待邮箱页面", wait_recaptcha_before_email: "等待验证加载", email_once: "提交邮箱", password_once: "提交密码", wait_recaptcha_initialization: "等待验证加载", wait_exchange: "等待登录回调", wait_com_return: "返回活动页面", readonly_com_fan: "读取报名记录", capture_page: "生成整页截图", browser_driver: "浏览器驱动崩溃", browser_process: "浏览器进程异常", complete: "查询结束", runner: "查询进程异常", timeout: "查询超时" };
 const esc = value => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 const date = value => value ? new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }) : "—";
 const badge = status => `<span class="badge ${esc(status)}">${esc(statusNames[status] || status)}</span>`;
@@ -34,7 +33,7 @@ function render() {
   if (!batch) {
     $("batch-label").textContent = "QUERY RESULTS";
     $("batch-meta").textContent = "导入表格后，从这里开始查询";
-    for (const name of ["start", "cancel", "retry", "continuous-retry", "resume", "export", "delete"]) $(`${name}-button`).hidden = true;
+    for (const name of ["start", "cancel", "retry", "human-retry", "continuous-retry", "resume", "export", "delete"]) $(`${name}-button`).hidden = true;
     for (const name of ["total", "success", "running", "failed"]) $(`${name}-stat`).textContent = "0";
     $("progress-bar").style.width = "0%";
     $("batch-error").hidden = true;
@@ -57,6 +56,10 @@ function render() {
   $("start-button").hidden = batch.status !== "draft";
   $("cancel-button").hidden = batch.status !== "running";
   const failedCount = all.filter(row => failedStatuses.has(row.status)).length;
+  const humanCount = all.filter(row => row.status === "needs-human").length;
+  $("human-retry-button").hidden = humanCount === 0;
+  $("human-retry-button").disabled = batch.status === "draft";
+  $("human-retry-button").textContent = `重试需人工处理 (${humanCount})`;
   $("retry-button").hidden = false;
   $("retry-button").disabled = batch.status === "draft" || failedCount === 0;
   $("continuous-retry-button").hidden = false;
@@ -89,24 +92,36 @@ function renderProxies() {
   if (!proxy) return;
   const checking = proxy.status === "checking";
   if ($("filter-proxies")) {
-    $("filter-proxies").hidden = !proxy.supports_api_filter;
+    $("filter-proxies").hidden = true;
     $("filter-proxies").disabled = checking;
-    $("filter-proxies").textContent = checking && proxy.mode === "api" ? "正在筛选…" : "筛选美国 / 新加坡 / 澳大利亚";
+    $("filter-proxies").textContent = checking && proxy.mode === "api" ? "正在筛选…" : "加载全部地区代理";
   }
   $("refresh-proxies").disabled = checking;
-  $("refresh-proxies").textContent = checking ? "正在刷新…" : "刷新美国代理";
-  $("proxy-status").textContent = checking ? (proxy.mode === "api" ? "读取接口筛选" : "检测美国出口") : proxy.status === "ready" ? `${proxy.mode === "api" ? "美 / 新 / 澳节点" : "美国节点"} ${proxy.accepted} 个` : proxy.status === "failed" ? "刷新失败" : proxy.status === "cancelled" ? "检测已取消" : "尚未刷新";
-  $("proxy-progress").textContent = checking ? `已检测 ${proxy.checked} / ${proxy.total || "…"}，通过 ${proxy.accepted} 个。` : proxy.error || (proxy.updated_at ? `${date(proxy.updated_at)} 更新${proxy.mode === "api" ? "（接口 IP 结果）" : ""}；查询和重试复用此名单。` : "先筛选美国 / 新加坡 / 澳大利亚；查询和重试复用名单。");
+  $("refresh-proxies").textContent = checking ? "正在加载…" : "更新全部地区代理";
+  $("proxy-status").textContent = checking ? (proxy.mode === "api" ? "读取全部地区节点" : "检测代理可用性") : proxy.status === "ready" ? `${proxy.mode === "api" ? "全部地区节点" : "可用节点"} ${proxy.accepted} 个` : proxy.status === "failed" ? "刷新失败" : proxy.status === "cancelled" ? "检测已取消" : "尚未刷新";
+  $("proxy-progress").textContent = checking ? `已检测 ${proxy.checked} / ${proxy.total || "…"}，通过 ${proxy.accepted} 个。` : proxy.error || (proxy.updated_at ? `${date(proxy.updated_at)} 更新${proxy.mode === "api" ? "（接口 IP 结果）" : ""}；查询和重试复用此名单。` : "先加载代理名单；不限地区，查询和重试复用名单。");
+  if (!checking && proxy.disabled_nodes) $("proxy-progress").textContent += ` ${proxy.disabled_nodes} 个节点已禁用，${proxy.available_nodes} 个可用；请到代理池页面手动恢复。`;
   $("proxy-progress").classList.toggle("error-message", proxy.status === "failed");
 }
 function renderDetailActions() {
   const row = state.detail;
   if (!row) return;
-  $("rerun-button").hidden = row.status === "needs-human" || state.batch?.status === "draft" || ["pending", "running"].includes(row.status) || state.batch?.status === "running" && row.status === "success";
+  $("rerun-button").hidden = state.batch?.status === "draft" || ["pending", "running"].includes(row.status) || state.batch?.status === "running" && row.status === "success";
+  $("rerun-button").textContent = row.status === "needs-human" ? "清除人工处理状态并重试" : "重新查询";
 }
 function renderRows() {
   const search = $("search").value.trim().toLowerCase();
-  const rows = state.runs.filter(row => row.email.toLowerCase().includes(search) && (state.filter === "all" || (state.filter === "success" ? row.status === "success" : !["success", "pending", "running"].includes(row.status))));
+  const matching = state.runs.filter(row => row.email.toLowerCase().includes(search));
+  const category = row => failedStatuses.has(row.status) ? "failed" : row.status;
+  const counts = { all: matching.length };
+  for (const row of matching) {
+    const key = category(row);
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  document.querySelectorAll("[data-filter-count]").forEach(counter => {
+    counter.textContent = counts[counter.dataset.filterCount] || 0;
+  });
+  const rows = matching.filter(row => state.filter === "all" || category(row) === state.filter);
   const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   state.page = Math.min(state.page, pages);
   const offset = (state.page - 1) * PAGE_SIZE;
@@ -117,10 +132,12 @@ function renderRows() {
   $("page-number").textContent = `${state.page} / ${pages}`;
   $("account-rows").innerHTML = visibleRows.map((row) => {
     let selected = '<span class="muted">—</span>';
-    if (row.selections !== null) {
+    if (row.verification_requirement) {
+      selected = `<span>${esc(row.verification_requirement)}</span>`;
+    } else if (row.selections !== null) {
       selected = row.selections.length ? `<strong>${row.selections.length} 场</strong><span class="selection-preview">${esc(row.selections.map(v => v.city || v.name).join(" · "))}</span>` : '<span class="muted">未选择场次</span>';
     }
-    return `<tr><td class="row-number">${String(row.source_line).padStart(2,"0")}</td><td><button class="email-button" data-detail="${row.id}">${esc(row.email)}</button><span class="account-date">${row.finished_at ? date(row.finished_at) : "尚未完成查询"}</span></td><td>${badge(row.status)}${row.attempt_count ? `<span class="stage-label">尝试 ${row.attempt_count} / ${MAX_ATTEMPTS}</span>` : ""}${row.status === "running" || row.stage === "retry_queued" || row.error ? `<span class="stage-label" title="${esc(row.error || stageNames[row.stage] || row.stage)}">${esc(stageNames[row.stage] || row.error || "准备查询")}</span>` : ""}${failedStatuses.has(row.status) && state.batch?.status !== "draft" ? `<button class="text-link row-retry" data-retry="${row.id}" aria-label="重试 ${esc(row.email)}">重试</button>` : ""}</td><td>${selected}</td><td class="last-col"><button class="detail-link" data-detail="${row.id}" aria-label="查看 ${esc(row.email)} 详情">↗</button></td></tr>`;
+    return `<tr><td class="row-number">${String(row.source_line).padStart(2,"0")}</td><td><button class="email-button" data-detail="${row.id}">${esc(row.email)}</button><span class="account-date">${row.finished_at ? date(row.finished_at) : "尚未完成查询"}</span></td><td>${badge(row.status)}${row.attempt_count ? `<span class="stage-label">本轮尝试 ${row.attempt_count} 次</span>` : ""}${row.status === "running" || row.stage === "retry_queued" || row.error ? `<span class="stage-label" title="${esc(row.error || stageNames[row.stage] || row.stage)}">${esc(stageNames[row.stage] || row.error || "准备查询")}</span>` : ""}${failedStatuses.has(row.status) && state.batch?.status !== "draft" ? `<button class="text-link row-retry" data-retry="${row.id}" aria-label="重试 ${esc(row.email)}">重试</button>` : ""}</td><td>${selected}</td><td class="last-col"><button class="detail-link" data-detail="${row.id}" aria-label="查看 ${esc(row.email)} 详情">↗</button></td></tr>`;
   }).join("");
   $("table-scroll").hidden = !rows.length;
   $("empty-state").hidden = !!rows.length;
@@ -168,9 +185,11 @@ async function openDetail(id) {
   $("detail-state").innerHTML = badge(data.status);
   $("detail-events").innerHTML = data.selections === null ? '<p class="muted">尚未取得场次记录。</p>' : data.selections.length ? data.selections.map(v => `<div class="event-item"><span class="event-date">${esc(v.date || "日期未解析")}</span><div class="event-name">${esc(v.city ? [v.city,v.state].filter(Boolean).join(", ") : v.name)}</div><div class="event-venue">${esc(v.venue || v.id)}</div></div>`).join("") : '<p class="muted">这个账号在该活动中未选择场次。</p>';
   const result = data.result || {}, progress = data.progress || {};
+  if (result.verificationRequirement) $("detail-events").innerHTML = `<p>${esc(result.verificationRequirement)}</p>`;
   const fields = [["查询时间", date(data.finished_at || data.started_at)], ["最后阶段", stageNames[data.stage] || data.stage || "等待查询"], ["代理节点", result.proxyNode?.name || "—"], ["邮箱 / 密码", `${result.emailStatus || progress.emailStatus || "—"} / ${result.passwordStatus || progress.passwordStatus || "—"}`]];
-  if (data.attempt_count) fields.push(["尝试次数", `${data.attempt_count} / ${MAX_ATTEMPTS}`]);
+  if (data.attempt_count) fields.push(["尝试次数", `${data.attempt_count}`]);
   if (result.proxyNode?.screening?.exitIP) fields.push(["出口 IP（筛选时）", result.proxyNode.screening.exitIP]);
+  if (result.proxyReputation) fields.push(["代理信誉（本次结束时）", `${result.proxyReputation.confidence} / 10`]);
   if (result.errorType) fields.push(["异常类型", result.errorType]);
   if (result.lastStage) fields.push(["崩溃前阶段", stageNames[result.lastStage] || result.lastStage]);
   $("detail-metadata").innerHTML = fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join("");
@@ -179,7 +198,7 @@ async function openDetail(id) {
   renderDetailActions();
   $("download-shot").hidden = !data.has_screenshot;
   $("download-shot").href = `/api/runs/${id}/screenshot?download=1`;
-  $("screenshot-kind").textContent = !data.has_screenshot ? "" : data.screenshot_kind === "full-page" ? `整页长截图${result.screenshotHeight ? ` · ${result.screenshotWidth} × ${result.screenshotHeight}` : ""}` : data.screenshot_kind === "legacy-viewport" ? "历史截图 · 仅包含当时第一屏" : "失败时页面";
+  $("screenshot-kind").textContent = !data.has_screenshot ? "" : result.verificationRequirement ? "验证要求页面" : data.screenshot_kind === "full-page" ? `整页长截图${result.screenshotHeight ? ` · ${result.screenshotWidth} × ${result.screenshotHeight}` : ""}` : data.screenshot_kind === "legacy-viewport" ? "历史截图 · 仅包含当时第一屏" : "失败时页面";
   $("screenshot-content").innerHTML = data.has_screenshot ? `<a href="/api/runs/${id}/screenshot" target="_blank" rel="noopener" aria-label="打开原始页面截图"><img src="/api/runs/${id}/screenshot" alt="${esc(data.email)} 的查询页面截图"></a>` : '<div class="empty-state"><h3>暂无页面截图</h3><p>完成查询后，整页截图会出现在这里。</p></div>';
   if (!$("detail-dialog").open) $("detail-dialog").showModal();
 }
@@ -267,13 +286,13 @@ $("filter-proxies")?.addEventListener("click", event => action(event.target, asy
   const campaign = state.batch?.campaign || $("campaign").value.trim();
   await api("/api/proxies/filter", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({campaign})});
   await refresh();
-  toast("按接口现有 IP 结果筛选美国、新加坡、澳大利亚节点，完成后查询和重试复用此名单。");
+  toast("按接口现有 IP 记录加载全部地区节点，完成后查询和重试复用此名单。");
 }));
 $("refresh-proxies").addEventListener("click", event => action(event.target, async () => {
   const campaign = state.batch?.campaign || $("campaign").value.trim();
-  await api("/api/proxies/refresh", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({campaign})});
+  await api("/api/proxies/refresh", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({campaign, mode:"api"})});
   await refresh();
-  toast("正在读取最新节点并检测美国出口，进度会自动更新。");
+  toast("正在加载全部地区代理，不按国家或活动页进行预筛选。");
 }));
 $("apply-concurrency").addEventListener("click", event => action(event.target, async () => {
   await api(`/api/batches/${state.batch.id}/concurrency`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({concurrency:readCount("concurrency")})});
@@ -295,6 +314,7 @@ $("delete-button").addEventListener("click", event => action(event.target, async
   toast("任务及其账号记录、Cookie 和截图已删除。");
 }));
 async function retry(runId, scope = "failed") {
+  if (runId && state.runs.find(row => row.id === runId)?.status === "needs-human") scope = "human";
   const running = state.batch.status === "running";
   const data = await api(`/api/batches/${state.batch.id}/retry`, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ start: true, scope, ...(!running ? {concurrency:readCount("concurrency")} : {}), ...(runId ? {run_id:runId} : {}) }) });
   $("detail-dialog").close();
@@ -308,6 +328,7 @@ $("continuous-retry-button").addEventListener("click", event => action(event.tar
   toast(enabled ? "已开启持续重试，失败账号将自动重新排队。" : "已关闭持续重试，当前查询会继续完成。");
 }));
 $("retry-button").addEventListener("click", event => action(event.target, () => retry()));
+$("human-retry-button").addEventListener("click", event => action(event.target, () => retry(null, "human")));
 $("resume-button").addEventListener("click", event => action(event.target, () => retry(null, "unfinished")));
 $("rerun-button").addEventListener("click", event => action(event.target, () => retry(state.detail.id)));
 $("close-detail").addEventListener("click", () => { clearAccountFields(); $("detail-dialog").close(); });

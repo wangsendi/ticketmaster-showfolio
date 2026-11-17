@@ -5,7 +5,77 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const { firefox } = require("playwright");
-const { capturePage } = require("../src/capture.cjs");
+const { capturePage, capturePageWithRefresh } = require("../src/capture.cjs");
+
+const screenshotTimeout = () => Object.assign(new Error("screenshot timed out"), { name: "TimeoutError" });
+
+test("retries a screenshot on the same page before refreshing", async () => {
+  let captures = 0;
+  const result = await capturePageWithRefresh({ reload: async () => assert.fail("unexpected refresh") }, "page.png", () => {}, {
+    capture: async () => {
+      if (++captures === 1) throw screenshotTimeout();
+      return { screenshotFullPage: true };
+    },
+  });
+  assert.equal(captures, 2);
+  assert.equal(result.screenshotRefreshes, 0);
+});
+
+test("screenshot timeouts refresh the same session up to three times", async () => {
+  let captures = 0, reloads = 0, verified = 0;
+  const page = { reload: async () => { reloads++; } };
+  const result = await capturePageWithRefresh(page, "page.png", () => {}, {
+    capture: async (current) => {
+      assert.equal(current, page);
+      if (++captures <= 7) throw screenshotTimeout();
+      return { screenshotFullPage: true };
+    },
+    afterRefresh: async () => { verified++; },
+  });
+  assert.equal(result.screenshotRefreshes, 3);
+  assert.equal(result.screenshotFullPage, true);
+  assert.equal(captures, 8);
+  assert.equal(reloads, 3);
+  assert.equal(verified, 3);
+});
+
+test("screenshot refreshes stop after three failures, including reload timeouts", async () => {
+  let reloads = 0, captures = 0;
+  await assert.rejects(capturePageWithRefresh({ reload: async () => {
+    reloads++;
+    throw screenshotTimeout();
+  } }, "page.png", () => {}, {
+    capture: async () => { captures++; throw screenshotTimeout(); },
+  }), { name: "TimeoutError" });
+  assert.equal(reloads, 3);
+  assert.equal(captures, 2);
+});
+
+test("successful screenshots and non-timeout failures do not refresh", async () => {
+  const page = { reload: async () => assert.fail("unexpected refresh") };
+  assert.equal((await capturePageWithRefresh(page, "page.png", () => {}, {
+    capture: async () => ({ screenshotFullPage: true }),
+  })).screenshotRefreshes, 0);
+  await assert.rejects(capturePageWithRefresh(page, "page.png", () => {}, {
+    capture: async () => { throw new Error("browser closed"); },
+  }), /browser closed/);
+});
+
+test("cancellation and failed account verification stop screenshot refreshes", async () => {
+  let cancelled = false, reloads = 0;
+  const page = { reload: async () => { reloads++; } };
+  await assert.rejects(capturePageWithRefresh(page, "page.png", () => {
+    if (cancelled) throw new Error("cancelled");
+  }, { capture: async () => { cancelled = true; throw screenshotTimeout(); } }), /cancelled/);
+  assert.equal(reloads, 0);
+  let captures = 0;
+  await assert.rejects(capturePageWithRefresh(page, "page.png", () => {}, {
+    capture: async () => { captures++; throw screenshotTimeout(); },
+    afterRefresh: async () => { throw new Error("account verification failed"); },
+  }), /account verification failed/);
+  assert.equal(captures, 2);
+  assert.equal(reloads, 1);
+});
 
 test("captures the whole page, including content loaded after scrolling", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "tm-capture-test-"));

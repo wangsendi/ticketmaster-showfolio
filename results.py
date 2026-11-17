@@ -10,6 +10,39 @@ from datetime import datetime
 from verify import audit, response_json
 
 
+def has_persona_evidence(result):
+    observations = [result.get("humanVerificationObservation") or {}, *(result.get("uiObservations") or [])]
+    return bool(result.get("personaVerificationRequired") or any(
+        item.get("personaPageVisible") or item.get("personaPromptVisible") for item in observations))
+
+
+def verification_requirement(result):
+    if not (result.get("requiresHumanInteraction") or has_persona_evidence(result)):
+        return None
+    observation = result.get("humanVerificationObservation") or {}
+    if result.get("browsingActivityPaused") or observation.get("browsingActivityPaused"):
+        return "访问已暂停（网站风控拦截）"
+    if has_persona_evidence(result):
+        return "未进行身份验证"
+    requirements = []
+    if observation.get("otpInputVisible"):
+        requirements.append("需要邮箱／短信验证码")
+    if observation.get("imageChallengeVisible"):
+        requirements.append("需要图片验证码")
+    if observation.get("checkboxChallengeVisible"):
+        requirements.append("需要勾选人机验证")
+    return "；".join(requirements) or "需要人工验证（网站未明确认证类型）"
+
+
+def verification_status(result):
+    observation = result.get("humanVerificationObservation") or {}
+    if result.get("browsingActivityPaused") or observation.get("browsingActivityPaused"):
+        return "failed"
+    if has_persona_evidence(result):
+        return "success"
+    return "needs-human"
+
+
 def selections_from_har(directory, email):
     entries = json.loads((Path(directory) / "com-login.har").read_text())["log"]["entries"]
     markets, records = {}, []
@@ -97,25 +130,36 @@ def collect(directory, email, summary):
         result.pop(key, None)
     data = {"result": result, "selections": None, "cookie_header": None, "error": None,
             "status": "cancelled" if summary.get("stopped") else "failed"}
-    if summary.get("requiresHumanInteraction") or summary.get("verificationRequired"):
+    requirement = verification_requirement(result)
+    if requirement:
         data["status"] = "needs-human"
-    if summary.get("authenticated"):
+        result["verificationRequirement"] = requirement
+    if summary.get("authenticated") and not requirement:
         try:
             result["verification"] = audit(directory, expected_email=email)
             data["cookie_header"] = (directory / "cookie-header.txt").read_text().rstrip("\r\n")
-            data["status"] = "partial"
-            data["selections"], result["entryRecord"] = selections_from_har(directory, email)
-            unresolved = any(not item["resolved"] for item in data["selections"])
-            if unresolved:
-                data["error"] = "已读取场次 ID，部分日期和场馆未解析。"
-            elif (directory / "com-result.png").is_file():
+        except (OSError, ValueError, KeyError, TypeError):
+            data["error"] = "登录结果核对未通过。"
+        else:
+            # The verified account screenshot is the deliverable; selections are optional.
+            if (directory / "com-result.png").is_file():
                 data["status"] = "success"
             else:
-                data["error"] = "已读取场次，但整页截图未生成。"
-        except (OSError, ValueError, KeyError, TypeError):
-            data["error"] = "已登录但场次解析失败。" if data["cookie_header"] else "登录结果核对未通过。"
+                data["status"] = "partial"
+                data["error"] = "已登录，但整页截图未生成。"
+            try:
+                data["selections"], result["entryRecord"] = selections_from_har(directory, email)
+                if any(not item["resolved"] for item in data["selections"]):
+                    result["selectionWarning"] = "已读取场次 ID，部分日期和场馆未解析。"
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                result["selectionWarning"] = "已登录但场次解析失败。"
+    if requirement and not summary.get("stopped"):
+        data["status"] = verification_status(result)
+        data["error"] = None
     if data["status"] in ("failed", "needs-human", "cancelled"):
-        if summary.get("errorType") == "PlaywrightWebSocketAssertion":
+        if requirement and verification_status(result) == "failed":
+            message = "网站已暂停访问（Browsing Activity Paused），可更换代理重试。"
+        elif summary.get("errorType") == "PlaywrightWebSocketAssertion":
             message = "Firefox 的 Playwright 驱动崩溃（WebSocket 事件断言），不是等待时间不足。"
         elif result.get("passwordStatus") == 403:
             errors = [item.get("businessError", {}) for item in result.get("responses", []) if item.get("path") == "/json/sign-in" and item.get("status") == 403]

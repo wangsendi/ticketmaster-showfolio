@@ -3,8 +3,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { chromium, firefox } = require('playwright');
 const CLOAK_VERSION = '146.0.7680.177.5';
+const DEFAULT_LOCALE = 'zh-CN';
 
 function configuredBrowser(fallback = process.env.TM_BROWSER || 'cloakbrowser', configPath = process.env.TM_BROWSER_CONFIG || path.join(__dirname, '../data/browser.json')) {
+  if (process.env.TM_BROWSER_OVERRIDE !== undefined) {
+    return browserConfig(process.env.TM_BROWSER_OVERRIDE).name;
+  }
   try {
     const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     if (!config || typeof config.browser !== 'string') throw new Error('invalid browser config');
@@ -34,7 +38,7 @@ async function cloakModule() {
 async function launchCloak(options) {
   const {launch} = await cloakModule();
   return launch({headless:options.headless, proxy:options.proxy,
-    locale:options.locale || 'en-US', timezone:options.timezone || 'America/New_York',
+    locale:options.locale || DEFAULT_LOCALE, timezone:options.timezone || 'America/New_York',
     browserVersion:CLOAK_VERSION, launchOptions:{timeout:options.timeout || 30000}});
 }
 
@@ -76,4 +80,4 @@ async function createBrowserContext(selected, browser, options = {}) {
   return browser.newContext(buildContextOptions({headless:false, contextOptions}));
 }
 
-module.exports = { browserConfig, assertBrowserInstalled, configuredBrowser, createBrowserContext, cloakModule, CLOAK_VERSION };
+module.exports = { browserConfig, assertBrowserInstalled, configuredBrowser, createBrowserContext, cloakModule, CLOAK_VERSION, DEFAULT_LOCALE };

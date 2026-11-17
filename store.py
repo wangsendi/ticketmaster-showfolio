@@ -39,6 +39,12 @@ class Store:
                     UNIQUE(batch_id, email COLLATE NOCASE)
                 );
                 CREATE INDEX IF NOT EXISTS runs_batch ON runs(batch_id, id);
+                CREATE TABLE IF NOT EXISTS proxy_reputations (
+                    route_key TEXT PRIMARY KEY,
+                    confidence INTEGER NOT NULL,
+                    disabled_until REAL NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
             """)
             if "effective_concurrency" not in {row["name"] for row in db.execute("PRAGMA table_info(batches)")}:
                 db.execute("ALTER TABLE batches ADD COLUMN effective_concurrency INTEGER")
@@ -46,7 +52,39 @@ class Store:
                 db.execute("ALTER TABLE batches ADD COLUMN continuous_retry INTEGER NOT NULL DEFAULT 0")
             if "attempt_count" not in {row["name"] for row in db.execute("PRAGMA table_info(runs)")}:
                 db.execute("ALTER TABLE runs ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
+            db.execute("UPDATE proxy_reputations SET confidence=0,disabled_until=-1 WHERE confidence=0 OR disabled_until<>0")
         self.path.chmod(0o600)
+        self.normalize_verification_results()
+
+    def normalize_verification_results(self):
+        from results import verification_requirement, verification_status
+        with self.connect(write=True) as db:
+            rows = db.execute("SELECT id,status,result FROM runs WHERE status='needs-human' OR (status='success' AND json_extract(result,'$.verificationRequirement')='未进行身份验证')").fetchall()
+            for row in rows:
+                result = json.loads(row["result"] or "{}")
+                requirement = verification_requirement(result)
+                if not requirement:
+                    if row["status"] == "success":
+                        result.pop("verificationRequirement", None)
+                        db.execute("UPDATE runs SET status='failed',stage=?,error=?,result=? WHERE id=? AND status='success'",
+                                   (result.get("failureStage") or "wait_exchange", "登录回调未完成，请重试。", dumps(result), row["id"]))
+                    continue
+                result["verificationRequirement"] = requirement
+                status = verification_status(result)
+                db.execute("UPDATE runs SET status=?,stage=?,error=CASE WHEN ? THEN NULL ELSE error END,result=? WHERE id=? AND status IN ('needs-human','success')",
+                           (status, "complete" if status == "success" else result.get("failureStage"), status == "success", dumps(result), row["id"]))
+
+    def proxy_reputations(self):
+        with self.connect() as db:
+            return {row["route_key"]:{"confidence":row["confidence"], "disabled_until":row["disabled_until"]}
+                    for row in db.execute("SELECT route_key,confidence,disabled_until FROM proxy_reputations")}
+
+    def save_proxy_reputation(self, route_key, confidence, disabled_until):
+        with self.connect(write=True) as db:
+            db.execute("""INSERT INTO proxy_reputations(route_key,confidence,disabled_until,updated_at)
+                VALUES(?,?,?,?) ON CONFLICT(route_key) DO UPDATE SET confidence=excluded.confidence,
+                disabled_until=excluded.disabled_until,updated_at=excluded.updated_at""",
+                       (route_key, confidence, disabled_until, now()))
 
     @contextmanager
     def connect(self, *, write=False):
@@ -100,7 +138,8 @@ class Store:
         credentials = ",password,cookie_header" if include_credentials else ""
         with self.connect() as db:
             rows = db.execute(f"""SELECT id,batch_id,source_line,email,status,stage,started_at,finished_at,selections,error,attempt_count,
-                screenshot IS NOT NULL has_screenshot, cookie_header IS NOT NULL has_cookie{credentials}
+                screenshot IS NOT NULL has_screenshot, cookie_header IS NOT NULL has_cookie,
+                json_extract(result, '$.verificationRequirement') AS verification_requirement{credentials}
                 FROM runs WHERE batch_id=? ORDER BY id""", (batch_id,)).fetchall()
         return [{**dict(row), "selections": json.loads(row["selections"]) if row["selections"] else None} for row in rows]
 
@@ -135,7 +174,7 @@ class Store:
         with self.connect(write=True) as db:
             db.execute("""UPDATE runs SET status=?,stage=?,finished_at=?,result=?,selections=?,cookie_header=?,
                 cookies=?,storage_state=?,screenshot=?,screenshot_kind=?,diagnostic_log=?,error=? WHERE id=?""",
-                (data["status"], result.get("failureStage") or "complete", now(), dumps(result), dumps(data.get("selections")),
+                (data["status"], "complete" if data["status"] == "success" else result.get("failureStage") or "complete", now(), dumps(result), dumps(data.get("selections")),
                  data.get("cookie_header"), dumps(data.get("cookies")), dumps(data.get("storage_state")), data.get("screenshot"),
                  data.get("screenshot_kind"), data.get("diagnostic_log"), data.get("error"), run_id))
 

@@ -90,13 +90,32 @@ def create_app(database=None, service_options=None, recover=False):
     def proxy_status():
         return jsonify(**service.proxy_status(), supports_background_exports=True)
 
+    @app.get("/proxies")
+    def proxies_page():
+        return render_template("proxies.html", token=token, campaign=DEFAULT_URL)
+
+    @app.get("/api/proxies/nodes")
+    def proxy_nodes():
+        return jsonify(service.proxy_nodes())
+
+    @app.post("/api/proxies/restore")
+    def restore_proxy():
+        value = request.get_json(silent=True)
+        if not isinstance(value, dict) or not isinstance(value.get("node_id"), str) or not value["node_id"]:
+            raise ValueError("代理节点 ID 无效。")
+        return jsonify(ok=True, **service.restore_proxy(value["node_id"]))
+
+    @app.post("/api/proxies/restore-all")
+    def restore_all_proxies():
+        return jsonify(ok=True, restored=service.restore_all_proxies())
+
     @app.post("/api/proxies/refresh")
     @app.post("/api/proxies/filter")
     def refresh_proxies():
         value = request.get_json(silent=True) or {}
         if not isinstance(value, dict) or not isinstance(value.get("campaign", DEFAULT_URL), str):
             raise ValueError("代理刷新参数格式无效。")
-        service.refresh_proxies(validate_campaign(value.get("campaign", DEFAULT_URL).strip()), mode="api" if request.path.endswith("/filter") else value.get("mode", "verify"))
+        service.refresh_proxies(validate_campaign(value.get("campaign", DEFAULT_URL).strip()), mode="api" if request.path.endswith("/filter") else value.get("mode", "api"))
         return jsonify(ok=True), 202
 
     @app.post("/api/import")
@@ -163,7 +182,7 @@ def create_app(database=None, service_options=None, recover=False):
             raise ValueError("账号记录 ID 无效。")
         start = value.get("start", False)
         scope = value.get("scope", "unfinished")
-        if type(start) is not bool or scope not in ("failed", "unfinished"):
+        if type(start) is not bool or scope not in ("failed", "unfinished", "human"):
             raise ValueError("重试参数格式无效。")
         concurrency = positive_count(value.get("concurrency"), "并发数", optional=True)
         return jsonify(id=service.retry(batch_id, run_id, scope=scope, start=start, concurrency=concurrency)), 202 if start else 200
@@ -234,7 +253,11 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8088)
     parser.add_argument("--database", type=Path, default=ROOT / "data/ticketmaster.sqlite3")
+    parser.add_argument("--browser", choices=("cloakbrowser", "firefox", "chromium", "chrome"),
+                        help="指定本次服务使用的浏览器，优先于 data/browser.json")
     args = parser.parse_args()
+    if args.browser is not None:
+        os.environ["TM_BROWSER_OVERRIDE"] = args.browser
     args.database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # A second server must not mistake live jobs for interrupted ones.
     import fcntl

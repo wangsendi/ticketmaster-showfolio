@@ -1,8 +1,9 @@
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
-const { assertBrowserInstalled, configuredBrowser, createBrowserContext } = require("./browser.cjs");
-const { capturePage } = require("./capture.cjs");
+const { assertBrowserInstalled, configuredBrowser, createBrowserContext, DEFAULT_LOCALE } = require("./browser.cjs");
+const { capturePageWithRefresh } = require("./capture.cjs");
+const { observePersona } = require("./persona.cjs");
 const { enterOfficialLogin, EMAIL_SELECTOR, isBrowsingPaused } = require("./login-navigation.cjs");
 const { createBridge } = require("./proxy-bridge.cjs");
 
@@ -34,6 +35,7 @@ async function main() {
   const result = {
     startedAtUTC: new Date().toISOString(),
     headless: false,
+    locale: DEFAULT_LOCALE,
     usesXvfb: !!input.usesXvfb,
     networkMode: input.networkMode || "existing_system_network",
     networkConfigurationChanged: false,
@@ -129,8 +131,11 @@ async function main() {
           if (await onScreen(frame.locator("#recaptcha-anchor").first()))
             observation.checkboxChallengeVisible = true;
         }
-        if (/inquiry\.withpersona\.com/.test(u))
-          observation.personaPageVisible = true;
+      }
+      Object.assign(observation, await observePersona(page, onScreen));
+      if (observation.personaPageVisible || observation.personaPromptVisible) {
+        result.personaVerificationRequired = true;
+        result.verificationRequired = true;
       }
       observation.otpInputVisible = await onScreen(
         page
@@ -145,7 +150,8 @@ async function main() {
         observation.imageChallengeVisible ||
         observation.checkboxChallengeVisible ||
         observation.otpInputVisible ||
-        observation.personaPageVisible;
+        observation.personaPageVisible ||
+        observation.personaPromptVisible;
       if (human) {
         const file = observation.browsingActivityPaused ? "observed-verification.png" : label.replace(/[^a-z0-9-]/gi, "_") + ".png";
         await page
@@ -198,7 +204,8 @@ async function main() {
     result.browser = selected.name;
     const launchOptions = { ...selected.launchOptions, headless: false, timeout: 30000 };
     if (selected.name === "cloakbrowser") {
-      launchOptions.locale = input.locale || "en-US";
+      // New children use the current locale even if the Python service still sends an old default.
+      launchOptions.locale = DEFAULT_LOCALE;
       launchOptions.timezone = input.timezoneId || "America/New_York";
     }
     if (input.proxy) {
@@ -223,7 +230,7 @@ async function main() {
     result.displayEnvironmentPresent = !!process.env.DISPLAY;
     context = await createBrowserContext(selected, browser, {
       viewport: { width: 1440, height: 1000 },
-      locale: input.locale || "en-US",
+      locale: DEFAULT_LOCALE,
       timezoneId: input.timezoneId || "America/New_York",
       recordHar: {
         path: path.join(out, "com-login.har"),
@@ -334,7 +341,7 @@ async function main() {
               item.responseFieldNames = Object.keys(json).sort();
               if (u.pathname === "/json/sign-in" && json.flow === "add-passkey")
                 result.optionalPasskey = true;
-              if (json.inquiryData) result.verificationRequired = true;
+              if (json.inquiryData) result.inquiryDataObserved = true;
               if (u.pathname === "/json/sign-in") {
                 try {
                   const data = JSON.parse(request.postData() || "{}");
@@ -608,7 +615,28 @@ async function main() {
     if (!verifiedCookieHeader)
       throw new Error("Authenticated Fan Cookie header was not captured");
     stage = "capture_page";
-    Object.assign(result, await capturePage(page, path.join(out, "com-result.png"), checkStopped));
+    Object.assign(result, await capturePageWithRefresh(page, path.join(out, "com-result.png"), checkStopped, {
+      onRefresh: (count) => {
+        result.screenshotRefreshes = count;
+        result.fanIsLoggedIn = null;
+        result.fanAccountMatches = false;
+        verifiedCookieHeader = null;
+      },
+      afterRefresh: async () => {
+        const until = Date.now() + 30000;
+        while (Date.now() < until && result.fanIsLoggedIn !== true) {
+          checkStopped();
+          await wait(500);
+        }
+        await Promise.allSettled(pending);
+        checkStopped();
+        if (result.fanIsLoggedIn !== true || !result.fanAccountMatches || !verifiedCookieHeader)
+          throw new Error("Authenticated Fan response not verified after screenshot refresh");
+        const current = new URL(page.url());
+        if (current.origin !== startURL.origin || current.pathname !== startURL.pathname)
+          throw new Error("Campaign page changed after screenshot refresh");
+      },
+    }));
     result.loginCompleted = true;
   } catch (error) {
     result.failureStage = stage;

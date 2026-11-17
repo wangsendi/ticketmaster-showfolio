@@ -19,7 +19,6 @@ from proxy_pool import DEFAULT_PROXY_API, ProxyPool
 DEFAULT_CAMPAIGN = "https://signup.ticketmaster.com/noahkahan"
 GEO_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 FALLBACK_GEO_URL = "https://ipinfo.io/json"
-API_FILTER_COUNTRIES = frozenset(("US", "SG", "AU"))
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0"
 
 
@@ -44,7 +43,7 @@ def request(pool, node, url, stop_event=None):
                    "dump-header": directory / "headers", "output": directory / "body",
                    "write-out": "%{http_code} %{time_total}", "user-agent": USER_AGENT}
         config = "\n".join(f"{key} = {curl_quote(value)}" for key, value in options.items())
-        config += '\nheader = "Accept-Language: en-GB"\n'
+        config += '\nheader = "Accept-Language: zh-CN"\n'
         environment = {k: v for k, v in os.environ.items()
                        if k.lower() not in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")
                        and k not in ("TM_TEST_EMAIL", "TM_TEST_PASS")}
@@ -115,7 +114,8 @@ def inspect_node(pool, node, country, campaign, stop_event=None):
     result = {"node": {key: node[key] for key in ("id", "name", "protocol", "health")},
               "checkedAtUTC": datetime.now(timezone.utc).isoformat(), "accepted": False}
     result["exit"] = exit_location(pool, node, **options)
-    if result["exit"]["country"] != country:
+    actual_country = result["exit"]["country"]
+    if not actual_country or (country is not None and actual_country != country):
         result["reason"] = "country_mismatch" if result["exit"]["country"] else "country_unverified"
         return result
     response, body = request(pool, node, campaign, **options)
@@ -130,7 +130,7 @@ def inspect_node(pool, node, country, campaign, stop_event=None):
         return result
     # A second connection catches balancers that switch between countries.
     result["exitAfterCampaign"] = exit_location(pool, node, **options)
-    if result["exitAfterCampaign"]["country"] != country:
+    if result["exitAfterCampaign"]["country"] != actual_country:
         result["reason"] = "country_changed_or_unverified"
         return result
     result.update(accepted=True, reason="passed")
@@ -138,7 +138,7 @@ def inspect_node(pool, node, country, campaign, stop_event=None):
 
 
 def filtered_pool_from_api(nodes_url, campaign, stop_event=None, on_progress=None):
-    """Filter existing IP-check JSON. No network probes or campaign requests."""
+    """Load every region with a valid recorded exit IP; do not probe the network."""
     check_cancelled(stop_event)
     pool = ProxyPool.from_api(nodes_url)
     check_cancelled(stop_event)
@@ -147,19 +147,19 @@ def filtered_pool_from_api(nodes_url, campaign, stop_event=None, on_progress=Non
     for node in pool.nodes:
         check_cancelled(stop_event)
         location = node.get("reported_exit", {})
-        if location.get("country") in API_FILTER_COUNTRIES:
+        if location.get("country") and location.get("ip"):
             accepted.append({**node, "screening":{"country":location["country"], "exitIP":location["ip"],
                 "checkedAtUTC":location.get("checkedAtUTC"), "campaignURL":campaign, "method":"api_json"}})
     if on_progress:
         on_progress({"total":total, "checked":total, "accepted":len(accepted)})
     if not accepted:
-        raise ValueError("接口暂无有效的美国、新加坡或澳大利亚 IP 检测结果，请先在代理管理端更新 IP 检测后再筛选。")
+        raise ValueError("接口暂无有效的 IP 检测结果，请先在代理管理端更新 IP 检测后再加载。")
     pool.nodes = accepted
     return pool
 
 
-def fresh_us_pool(nodes_url, campaign, stop_event=None, on_progress=None, workers=8):
-    """Read current routes and verify US exits without any saved allowlist."""
+def fresh_pool(nodes_url, campaign, stop_event=None, on_progress=None, workers=8):
+    """Verify reachable COM campaign exits across all regions."""
     check_cancelled(stop_event)
     if not shutil.which("curl"):
         raise ValueError("检测代理需要 curl，请先安装 curl。")
@@ -170,7 +170,7 @@ def fresh_us_pool(nodes_url, campaign, stop_event=None, on_progress=None, worker
             on_progress({"total":total, "checked":checked, "accepted":len(accepted)})
     progress()
     with ThreadPoolExecutor(max_workers=min(workers, total), thread_name_prefix="proxy-check") as executor:
-        futures = {executor.submit(inspect_node, pool, node, "US", campaign, stop_event=stop_event):node for node in pool.nodes}
+        futures = {executor.submit(inspect_node, pool, node, None, campaign, stop_event=stop_event):node for node in pool.nodes}
         try:
             for future in as_completed(futures):
                 check_cancelled(stop_event)
@@ -178,7 +178,7 @@ def fresh_us_pool(nodes_url, campaign, stop_event=None, on_progress=None, worker
                 result = future.result()
                 checked += 1
                 if result["accepted"]:
-                    accepted.append({**node, "screening":{"country":"US", "exitIP":result["exitAfterCampaign"].get("ip"),
+                    accepted.append({**node, "screening":{"country":result["exitAfterCampaign"].get("country"), "exitIP":result["exitAfterCampaign"].get("ip"),
                                      "checkedAtUTC":result["checkedAtUTC"], "campaignURL":campaign}})
                 progress()
         finally:
@@ -186,7 +186,7 @@ def fresh_us_pool(nodes_url, campaign, stop_event=None, on_progress=None, worker
                 future.cancel()
     check_cancelled(stop_event)
     if not accepted:
-        raise ValueError("本次检测没有可用的美国代理出口，请更新代理后重新刷新。")
+        raise ValueError("本次检测没有可用的代理出口，请更新代理后重新刷新。")
     pool.nodes = accepted
     return pool
 
@@ -195,12 +195,12 @@ def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--proxy-api", default=DEFAULT_PROXY_API)
-    parser.add_argument("--country", default="US", help="实际出口国家代码，默认 US")
+    parser.add_argument("--country", help="可选的实际出口国家代码；默认不限地区")
     parser.add_argument("--url", default=DEFAULT_CAMPAIGN)
     parser.add_argument("--workers", type=int, default=4, help="并行检测数，1–8，默认 4")
     parser.add_argument("--out", type=Path, required=True, help="独立代理检测报告；网页会自动检测，无需读取此文件")
     args = parser.parse_args(argv)
-    if not re.fullmatch("[A-Z]{2}", args.country) or not 1 <= args.workers <= 8:
+    if (args.country is not None and not re.fullmatch("[A-Z]{2}", args.country)) or not 1 <= args.workers <= 8:
         raise ValueError("国家代码必须是两个大写字母，workers 必须为 1–8。")
     from urllib.parse import urlsplit
     target = urlsplit(args.url)

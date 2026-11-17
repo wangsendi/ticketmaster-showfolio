@@ -9,15 +9,26 @@ import traceback
 import threading
 import time
 
-from proxy_check import fresh_us_pool, filtered_pool_from_api
+from proxy_check import fresh_pool, filtered_pool_from_api
 from proxy_pool import DEFAULT_PROXY_API, NoAlternativeProxy, ProxyRefreshError
-from results import collect
+from results import collect, has_persona_evidence
 from runner import browser_command, run_account
 from store import now
 
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 1
 CONTINUOUS_RETRY_DELAY = 3
 logger = logging.getLogger(__name__)
+
+
+def proxy_outcome(data):
+    result = data.get("result", {})
+    if data["status"] == "cancelled" or has_persona_evidence(result):
+        return None
+    if result.get("verification", {}).get("authenticated"):
+        return True
+    if result.get("errorType") in ("PlaywrightWebSocketAssertion", "BrowserResultInvalid"):
+        return None
+    return data["status"] == "success"
 
 
 class QueryService:
@@ -42,11 +53,33 @@ class QueryService:
 
     def proxy_status(self):
         with self.proxy_state_lock:
-            return {**self.proxy_state, "supports_api_filter":True}
+            status = {**self.proxy_state, "supports_api_filter":True}
+        pool = self.current_pool
+        return {**status, **(pool.reputation_status() if pool else {})}
 
     def _proxy_progress(self, **values):
         with self.proxy_state_lock:
             self.proxy_state.update(values)
+
+    def proxy_nodes(self):
+        with self.proxy_state_lock:
+            state = dict(self.proxy_state)
+        pool = self.current_pool
+        details = pool.reputation_status(include_nodes=True) if pool else {"nodes":[], "disabled_nodes":0, "available_nodes":0}
+        details.pop("reputations", None)
+        return {**state, **details, "server_time":time.time()}
+
+    def restore_proxy(self, node_id):
+        with self.lock:
+            if self.current_pool is None:
+                raise ValueError("请先加载代理名单。")
+            return self.current_pool.restore(node_id)
+
+    def restore_all_proxies(self):
+        with self.lock:
+            if self.current_pool is None:
+                raise ValueError("请先加载代理名单。")
+            return self.current_pool.restore_all()
 
     def _load_pool(self, campaign, event, mode="verify"):
         while not self.proxy_scan_lock.acquire(timeout=0.2):
@@ -56,13 +89,14 @@ class QueryService:
             if event.is_set():
                 raise InterruptedError("代理检测已取消。")
             self._proxy_progress(status="checking", campaign=campaign, mode=mode, total=0, checked=0, accepted=0, error=None)
-            loader = filtered_pool_from_api if mode == "api" else fresh_us_pool
+            loader = filtered_pool_from_api if mode == "api" else fresh_pool
             pool = self.pool_factory(campaign) if self.pool_factory else loader(
                 self.proxy_api, campaign, stop_event=event, on_progress=lambda value:self._proxy_progress(**value))
             if event.is_set():
                 raise InterruptedError("代理检测已取消。")
             if not pool.nodes:
                 raise ValueError("本次筛选没有可用的代理出口，请更新代理后重新刷新。")
+            pool.configure_reputation(self.store)
             total = self.proxy_status()["total"] or len(pool.nodes)
             self._proxy_progress(status="ready", total=total, checked=total, accepted=len(pool.nodes), updated_at=now(), error=None)
             return pool
@@ -82,7 +116,7 @@ class QueryService:
         with self.lock:
             if mode == "verify" and any(self.store.batch(batch_id)["campaign"] != campaign
                                         for batch_id in self.active):
-                raise ValueError("存在其他活动的运行任务，请使用按地区筛选，或等这些任务结束后再检测活动代理。")
+                raise ValueError("存在其他活动的运行任务，请使用“加载全部地区代理”，或等这些任务结束后再检测活动代理。")
             self._refresh_proxies_locked(campaign, mode=mode)
 
     def _refresh_proxies_locked(self, campaign, mode="verify"):
@@ -116,7 +150,7 @@ class QueryService:
             raise ValueError("代理正在筛选或刷新，请等待完成后再开始查询。")
         pool = self.current_pool
         if pool is None or self.pool_mode != "api" and self.pool_campaign != campaign:
-            raise ValueError("请先点击“筛选美国 / 新加坡 / 澳大利亚”或“刷新美国代理”，完成后再开始查询。")
+            raise ValueError("请先点击“更新全部地区代理”，加载完成后再开始查询。")
         if not pool.refreshing and (pool.refresh_error or not pool.nodes):
             raise ValueError("当前没有可用的代理，请先手动刷新。")
         return pool
@@ -211,7 +245,12 @@ class QueryService:
         batch = self.store.batch(batch_id)
         if batch["status"] == "draft" or batch["status"] == "running" and not live:
             raise ValueError("请先完成或停止当前批次。")
-        if run_id is not None:
+        if scope == "human":
+            condition, parameters = "status='needs-human'", (batch_id,)
+            if run_id is not None:
+                condition += " AND id=?"
+                parameters += (run_id,)
+        elif run_id is not None:
             condition, parameters = "id=?", (batch_id, run_id)
             if live:
                 condition += " AND status NOT IN ('success','pending','running')"
@@ -221,13 +260,15 @@ class QueryService:
             condition, parameters = "status IN ('failed','partial','interrupted')", (batch_id,)
         else:
             condition, parameters = "status NOT IN ('success','pending','running')" if live else "status<>'success'", (batch_id,)
+        if scope != "human":
+            condition += " AND status<>'needs-human'"
         # Reset only the selected accounts, atomically with the batch state.
         # Old screenshots and cookies must not appear as this attempt's result.
         with self.store.connect(write=True) as db:
             rows = db.execute(f"""UPDATE runs SET status='pending',stage=?,started_at=NULL,finished_at=NULL,
                 progress=NULL,result=NULL,selections=NULL,cookie_header=NULL,cookies=NULL,storage_state=NULL,
                 screenshot=NULL,screenshot_kind=NULL,diagnostic_log=NULL,error=NULL,attempt_count=0
-                WHERE batch_id=? AND status<>'needs-human' AND ({condition}) RETURNING id""", ("retry_queued" if live else None, *parameters)).fetchall()
+                WHERE batch_id=? AND ({condition}) RETURNING id""", ("retry_queued" if live else None, *parameters)).fetchall()
             if not rows:
                 raise ValueError("没有需要重试的账号。")
             if not live:
@@ -265,12 +306,17 @@ class QueryService:
                     return
                 account = self.store.run(run_id)
                 previous, attempts = previous_proxies.pop(run_id, None), 0
+                if previous and len(pool.retry_exclusions(previous)) == len(pool.nodes):
+                    # A later queue turn can reuse the only exit after it is released.
+                    previous = None
                 data = {"status":"cancelled", "error":"查询已取消。", "result":{}}
                 while attempts < MAX_ATTEMPTS:
                     proxy = None
                     try:
                         if pool.refreshing:
                             self.store.progress(run_id, {"stage":"refresh_proxies"})
+                        else:
+                            self.store.progress(run_id, {"stage":"wait_proxy"})
                         with pool.lease(previous=previous, stop_event=event, wait=True) as proxy:
                             with gate:
                                 if event.wait(max(0, next_start[0] - time.monotonic())):
@@ -281,10 +327,21 @@ class QueryService:
                             self.store.begin_attempt(run_id, attempts, MAX_ATTEMPTS, proxy)
                             with tempfile.TemporaryDirectory(prefix="tm-query-") as temporary:
                                 out = Path(temporary) / "browser"
-                                summary = self.execute(account["email"], account["password"], out, command, xvfb, batch["campaign"],
-                                                       proxy=proxy, stop_event=event,
-                                                       on_progress=lambda value: self.store.progress(run_id, value))
-                                data = collect(out, account["email"], summary)
+                                try:
+                                    summary = self.execute(account["email"], account["password"], out, command, xvfb, batch["campaign"],
+                                                           proxy=proxy, stop_event=event,
+                                                           on_progress=lambda value: self.store.progress(run_id, value))
+                                    data = collect(out, account["email"], summary)
+                                except sqlite3.Error:
+                                    raise
+                                except Exception:
+                                    if not event.is_set():
+                                        pool.record_outcome(proxy, False)
+                                    raise
+                                outcome = None if event.is_set() else proxy_outcome(data)
+                                reputation = pool.record_outcome(proxy, outcome)
+                                if reputation:
+                                    data["result"]["proxyReputation"] = reputation
                     except NoAlternativeProxy as error:
                         if not attempts:
                             data = {"status":"failed", "error":None, "result":{"failureStage":"proxy_setup"}}
@@ -316,8 +373,6 @@ class QueryService:
                         break
                     self.store.progress(run_id, {"stage":"retry_wait"})
                 data["result"].update(attempts=attempts, maxAttempts=MAX_ATTEMPTS)
-                if data["status"] in ("failed", "partial") and attempts == MAX_ATTEMPTS:
-                    data["error"] = (data.get("error") or "查询未完成。") + f" 已尝试 {MAX_ATTEMPTS} 次，自动重试已结束。"
                 if previous is not None:
                     previous_proxies[run_id] = previous
                 self.store.finish_run(run_id, data)

@@ -5,7 +5,7 @@ import threading
 import time
 from unittest.mock import patch
 
-from proxy_check import DEFAULT_CAMPAIGN, FALLBACK_GEO_URL, GEO_URL, exit_location, fresh_us_pool, inspect_node, request
+from proxy_check import DEFAULT_CAMPAIGN, FALLBACK_GEO_URL, GEO_URL, exit_location, fresh_pool, inspect_node, request
 from proxy_pool import ProxyPool
 
 
@@ -34,6 +34,16 @@ class ProxyCheckTests(unittest.TestCase):
                 result = inspect_node(self.pool, self.node, "US", DEFAULT_CAMPAIGN)
                 self.assertFalse(result["accepted"])
                 request.assert_not_called()
+
+    def test_all_region_check_accepts_known_countries_and_rejects_unknown_exits(self):
+        for country in ("HK", "JP", "TW", "US", None):
+            with self.subTest(country=country), \
+                    patch("proxy_check.exit_location", return_value={"country":country,"ip":"192.0.2.1"}), \
+                    patch("proxy_check.request", return_value=({"status":200},self.html)) as probe:
+                result=inspect_node(self.pool,self.node,None,DEFAULT_CAMPAIGN)
+                self.assertEqual(result["accepted"],country is not None)
+                if country is None:
+                    probe.assert_not_called()
 
     def test_rejects_redirects_error_pages_and_partial_responses(self):
         cases = [({"status": 307, "location": "https://signup.ticketmaster.ca/noahkahan"}, self.html),
@@ -75,10 +85,11 @@ class ProxyCheckTests(unittest.TestCase):
         second = ProxyPool([{**self.node, "id":"new-us"}], "127.0.0.1", 10801, "private-password")
         progress = []
         def inspect(pool, node, country, campaign, **kwargs):
+            self.assertIsNone(country)
             return {"accepted":node["id"] != "foreign", "exitAfterCampaign":self.us, "checkedAtUTC":"fixture-time"}
         with patch("proxy_check.ProxyPool.from_api", side_effect=[first, second]) as api, patch("proxy_check.inspect_node", side_effect=inspect):
-            one = fresh_us_pool("http://localhost/api/nodes", DEFAULT_CAMPAIGN, on_progress=progress.append)
-            two = fresh_us_pool("http://localhost/api/nodes", DEFAULT_CAMPAIGN)
+            one = fresh_pool("http://localhost/api/nodes", DEFAULT_CAMPAIGN, on_progress=progress.append)
+            two = fresh_pool("http://localhost/api/nodes", DEFAULT_CAMPAIGN)
         self.assertEqual(api.call_count, 2)
         self.assertEqual([n["id"] for n in one.nodes], ["node-1"])
         self.assertEqual([n["id"] for n in two.nodes], ["new-us"])
@@ -86,10 +97,20 @@ class ProxyCheckTests(unittest.TestCase):
         self.assertNotIn("private", str(progress))
         self.assertEqual(two.nodes[0]["screening"]["country"], "US")
 
-    def test_refresh_with_no_verified_us_nodes_fails(self):
+    def test_refresh_with_no_verified_nodes_fails(self):
         with patch("proxy_check.ProxyPool.from_api", return_value=self.pool), patch("proxy_check.inspect_node", return_value={"accepted":False}):
-            with self.assertRaisesRegex(ValueError, "没有可用的美国"):
-                fresh_us_pool("http://localhost/api/nodes", DEFAULT_CAMPAIGN)
+            with self.assertRaisesRegex(ValueError, "没有可用的"):
+                fresh_pool("http://localhost/api/nodes", DEFAULT_CAMPAIGN)
+
+    def test_verified_pool_preserves_each_nodes_actual_region(self):
+        nodes=[{**self.node,"id":country} for country in ("HK","JP")]
+        pool=ProxyPool(nodes,"127.0.0.1",10801,"private-password")
+        def inspect(pool,node,country,campaign,**kwargs):
+            self.assertIsNone(country)
+            return {"accepted":True,"exitAfterCampaign":{"country":node["id"],"ip":"192.0.2.1"},"checkedAtUTC":"fixture"}
+        with patch("proxy_check.ProxyPool.from_api",return_value=pool), patch("proxy_check.inspect_node",side_effect=inspect):
+            verified=fresh_pool("http://localhost/api/nodes",DEFAULT_CAMPAIGN)
+        self.assertEqual({n["screening"]["country"] for n in verified.nodes},{"HK","JP"})
 
     def test_cancelled_refresh_does_not_return_a_partial_pool(self):
         stop = threading.Event()
@@ -98,7 +119,7 @@ class ProxyCheckTests(unittest.TestCase):
             return {"accepted":True, "exitAfterCampaign":self.us, "checkedAtUTC":"fixture-time"}
         with patch("proxy_check.ProxyPool.from_api", return_value=self.pool), patch("proxy_check.inspect_node", side_effect=inspect):
             with self.assertRaises(InterruptedError):
-                fresh_us_pool("http://localhost/api/nodes", DEFAULT_CAMPAIGN, stop_event=stop)
+                fresh_pool("http://localhost/api/nodes", DEFAULT_CAMPAIGN, stop_event=stop)
 
     def test_cancelled_probe_terminates_its_subprocess(self):
         stop = threading.Event()

@@ -6,6 +6,7 @@ import ipaddress
 import random
 from pathlib import Path
 import threading
+import time
 from urllib.error import URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import ProxyHandler, Request, build_opener
@@ -13,6 +14,8 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 DEFAULT_PROXY_API = "http://127.0.0.1:10802/api/nodes"
 NETWORK_MODE = "random_onesocks_proxy"
+PROXY_CONFIDENCE = 10
+PROXY_DISABLED = -1
 
 
 class NoAlternativeProxy(ValueError):
@@ -41,8 +44,109 @@ class ProxyPool:
         self.lock = threading.Lock()
         self.available = threading.Condition(self.lock)
         self.leased = set()
+        self.leased_routes = {}
         self.refreshing = False
         self.refresh_error = None
+        self.reputations = {}
+        self.reputation_store = None
+
+    @staticmethod
+    def reputation_key(node):
+        return "node:" + node["id"]
+
+    @staticmethod
+    def route_key(node):
+        address = node.get("screening", {}).get("exitIP")
+        if address:
+            return "ip:" + address
+        return "node:" + node["id"]
+
+    def configure_reputation(self, store):
+        with self.available:
+            self.reputation_store = store
+            self.reputations.update(store.proxy_reputations())
+
+    def _reputation(self, node):
+        key = self.reputation_key(node)
+        state = self.reputations.get(key, {"confidence":PROXY_CONFIDENCE, "disabled_until":0})
+        if (state["confidence"] == 0 or state["disabled_until"]) and state != {"confidence":0, "disabled_until":PROXY_DISABLED}:
+            state = {"confidence":0, "disabled_until":PROXY_DISABLED}
+            self.reputations[key] = state
+            if self.reputation_store:
+                self.reputation_store.save_proxy_reputation(key, **state)
+        return state
+
+    def record_outcome(self, proxy, success):
+        """Record an account attempt once, while its route is still leased."""
+        if success is None:
+            return
+        with self.available:
+            key = self.reputation_key(proxy.node)
+            current = self._reputation(proxy.node)
+            if current["disabled_until"]:
+                # An already-running request must not automatically restore a disabled IP.
+                return dict(current)
+            if success:
+                state = {"confidence":PROXY_CONFIDENCE, "disabled_until":0}
+            else:
+                score = max(0, current["confidence"] - 1)
+                state = {"confidence":score, "disabled_until":PROXY_DISABLED if score == 0 else 0}
+            self.reputations[key] = state
+            if self.reputation_store:
+                self.reputation_store.save_proxy_reputation(key, **state)
+            self.available.notify_all()
+            return dict(state)
+
+    def _disabled_ids(self):
+        return {node["id"] for node in self.nodes if self._reputation(node)["disabled_until"]}
+
+    def _busy_ids(self):
+        # Keep the original route reserved even when a refresh replaces its node.
+        routes = set(self.leased_routes.values())
+        return self.leased | {node["id"] for node in self.nodes if self.route_key(node) in routes}
+
+    def restore(self, node_id):
+        with self.available:
+            node = next((node for node in self.nodes if node["id"] == node_id), None)
+            if node is None:
+                raise ValueError("代理节点不存在，请更新名单后重试。")
+            key = self.reputation_key(node)
+            state = {"confidence":PROXY_CONFIDENCE, "disabled_until":0}
+            if self.reputation_store:
+                self.reputation_store.save_proxy_reputation(key, **state)
+            self.reputations[key] = state
+            self.available.notify_all()
+            return dict(state)
+
+    def restore_all(self):
+        with self.available:
+            restored = 0
+            for key, current in list(self.reputations.items()):
+                if not key.startswith("node:") or (current["confidence"] > 0 and not current["disabled_until"]):
+                    continue
+                state = {"confidence":PROXY_CONFIDENCE, "disabled_until":0}
+                if self.reputation_store:
+                    self.reputation_store.save_proxy_reputation(key, **state)
+                self.reputations[key] = state
+                restored += 1
+            self.available.notify_all()
+            return restored
+
+    def reputation_status(self, include_nodes=False):
+        with self.lock:
+            disabled = self._disabled_ids()
+            busy = self._busy_ids()
+            routes = {self.reputation_key(node):self._reputation(node) for node in self.nodes}
+            status = {"disabled_nodes":len(disabled), "available_nodes":len(self.nodes) - len(disabled),
+                      "reputations":[{"route":key, **value} for key, value in routes.items()]}
+            if include_nodes:
+                status["nodes"] = [{"id":node["id"], "name":node["name"] if isinstance(node.get("name"), str) and node["name"] else node["id"],
+                    "exit_ip":node.get("screening", {}).get("exitIP"),
+                    "country":node.get("screening", {}).get("country"),
+                    **self._reputation(node),
+                    "status":"disabled" if node["id"] in disabled else "in-use" if node["id"] in busy else "available"}
+                    for node in self.nodes]
+            return status
 
     @classmethod
     def from_api(cls, nodes_url):
@@ -156,8 +260,8 @@ class ProxyPool:
             if isinstance(result, dict) and result.get("accepted") and isinstance(result.get("node"), dict):
                 location = result.get("exitAfterCampaign") or result.get("exit") or {}
                 if isinstance(location, dict) and isinstance(location.get("ip"), str):
-                    exits[result["node"].get("id")] = location["ip"]
-        self.nodes = [{**node, "screening": {"country": report.get("country"), "exitIP": exits.get(node["id"]),
+                    exits[result["node"].get("id")] = location
+        self.nodes = [{**node, "screening": {"country": exits.get(node["id"], {}).get("country", report.get("country")), "exitIP": exits.get(node["id"], {}).get("ip"),
                        "checkedAtUTC": report.get("finishedAtUTC", report.get("checkedAtUTC")),
                        "campaignURL": campaign_url}} for node in nodes]
         self.remaining = []
@@ -166,11 +270,11 @@ class ProxyPool:
     def select(self):
         """Shuffle a full cycle, avoiding immediate reuse across cycle boundaries."""
         with self.lock:
-            return self._select(self.leased)
+            return self._select(self._busy_ids() | self._disabled_ids())
 
     @contextmanager
     def lease(self, exclude_ids=(), stop_event=None, wait=False, previous=None):
-        """Keep the selected node exclusive until its account attempt finishes."""
+        """Keep the selected node and screened exit IP exclusive until the attempt finishes."""
         with self.available:
             while True:
                 if stop_event and stop_event.is_set():
@@ -183,18 +287,22 @@ class ProxyPool:
                 excluded = set(exclude_ids) | (self.retry_exclusions(previous) if previous else set())
                 if not any(node["id"] not in excluded for node in self.nodes):
                     raise NoAlternativeProxy("没有其他可用的代理出口，已停止自动重试。")
-                if any(node["id"] not in excluded | self.leased for node in self.nodes):
+                disabled = self._disabled_ids()
+                unavailable = excluded | self._busy_ids() | disabled
+                if any(node["id"] not in unavailable for node in self.nodes):
                     break
                 if not wait:
-                    raise ValueError("代理节点均在使用中，请降低并发数。")
+                    raise ValueError("代理节点均在使用中或已禁用，请手动恢复代理后重试。")
                 self.available.wait(timeout=0.2)
-            selected = self._select(self.leased | excluded)
+            selected = self._select(self._busy_ids() | excluded | self._disabled_ids())
             self.leased.add(selected.node["id"])
+            self.leased_routes[selected.node["id"]] = self.route_key(selected.node)
         try:
             yield selected
         finally:
             with self.available:
                 self.leased.remove(selected.node["id"])
+                self.leased_routes.pop(selected.node["id"])
                 self.available.notify_all()
 
     def begin_refresh(self):

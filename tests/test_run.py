@@ -30,6 +30,17 @@ class RunnerStopTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 selected_browser()
 
+    def test_startup_browser_overrides_runtime_config_and_reaches_child(self):
+        self.config_path.write_text('{"browser":"cloakbrowser"}')
+        with patch.dict(os.environ, {"TM_BROWSER_OVERRIDE": "firefox"}):
+            self.assertEqual(selected_browser(), "firefox")
+            script = "import json,sys; data=json.load(sys.stdin); print(json.dumps({'authenticated':False,'browser':data['browser']}))"
+            out = Path(self.settings.name) / "attempt"
+            result = run_account("sample@example.invalid", "fixture-secret", out,
+                                 [sys.executable, "-c", script], False, DEFAULT_URL)
+            self.assertEqual(result["browser"], "firefox")
+        self.assertEqual(selected_browser(), "cloakbrowser")
+
     def test_default_is_cloakbrowser_without_runtime_setting(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(selected_browser(), "cloakbrowser")

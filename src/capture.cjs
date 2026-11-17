@@ -27,4 +27,34 @@ async function capturePage(page, filename, checkStopped = () => {}) {
   return { screenshotFullPage: true, screenshotWidth: png.readUInt32BE(16), screenshotHeight: png.readUInt32BE(20) };
 }
 
-module.exports = { capturePage };
+async function capturePageWithRefresh(page, filename, checkStopped = () => {}, {
+  capture = capturePage, onRefresh = () => {}, afterRefresh = () => {},
+} = {}) {
+  // Keep the authenticated browser session and retry locally before restarting login.
+  for (let refreshes = 0; refreshes <= 3; refreshes++) {
+    checkStopped();
+    try {
+      if (refreshes) {
+        await onRefresh(refreshes);
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
+        checkStopped();
+        await afterRefresh();
+      }
+      for (let attempt = 0; attempt < 2; attempt++) {
+        checkStopped();
+        try {
+          const result = await capture(page, filename, checkStopped);
+          return { ...result, screenshotRefreshes: refreshes };
+        } catch (error) {
+          checkStopped();
+          if (error.name !== "TimeoutError" || attempt === 1) throw error;
+        }
+      }
+    } catch (error) {
+      checkStopped();
+      if (error.name !== "TimeoutError" || refreshes === 3) throw error;
+    }
+  }
+}
+
+module.exports = { capturePage, capturePageWithRefresh };

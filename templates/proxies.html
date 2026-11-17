@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN" data-type="software">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="page-type" content="software">
+  <meta name="site-kind" content="software">
+  <meta name="app-token" content="{{ token }}">
+  <meta name="campaign" content="{{ campaign }}">
+  <title>代理池 · Ticketmaster</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/proxies.css">
+  <script defer src="/static/proxies.js"></script>
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/">TM<span class="brand-rule"></span><span>账号查询工作台</span></a><nav class="app-nav" aria-label="工作台导航"><a href="/">账号查询</a><a href="/proxies" aria-current="page">代理池</a></nav></header>
+  <main class="workspace proxy-workspace wrap">
+    <div class="page-heading"><div><p class="eyebrow">TICKETMASTER / PROXIES</p><h1>代理池</h1><p class="intro">查看出口 IP、信誉分与禁用状态。</p></div><div class="proxy-actions"><button class="secondary" id="restore-all-proxies" disabled>一键恢复全部禁用节点</button><button class="primary" id="update-proxies">更新代理名单</button></div></div>
+    <section class="proxy-summary" aria-label="代理状态统计">
+      <div><span>全部节点</span><strong id="total-nodes">—</strong></div>
+      <div><span>可分配</span><strong id="available-nodes">—</strong></div>
+      <div><span>使用中</span><strong id="busy-nodes">—</strong></div>
+      <div><span>已禁用</span><strong id="disabled-nodes">—</strong></div>
+    </section>
+    <p class="proxy-rules">初始 10 分 · 失败扣 1 分 · 成功恢复 10 分 · 降到 0 分禁用，需手动恢复<span>按节点独立计分和禁用 · 同一出口 IP 同时只分配给一个浏览器</span></p>
+    <p id="proxy-page-error" class="error-message" role="alert" hidden></p>
+    <section class="results-panel proxy-panel" aria-labelledby="nodes-title">
+      <div class="proxy-panel-heading"><h2 id="nodes-title">代理节点</h2><span id="sync-status" class="muted" role="status">正在读取代理池…</span></div>
+      <div class="table-toolbar">
+        <div class="filters" role="group" aria-label="筛选代理状态">
+          <button type="button" data-status="all" class="active" aria-pressed="true">全部 <span data-count="all">0</span></button>
+          <button type="button" data-status="available" aria-pressed="false">可分配 <span data-count="available">0</span></button>
+          <button type="button" data-status="in-use" aria-pressed="false">使用中 <span data-count="in-use">0</span></button>
+          <button type="button" data-status="disabled" aria-pressed="false">已禁用 <span data-count="disabled">0</span></button>
+        </div>
+        <label class="search-label"><span class="sr-only">搜索节点或出口 IP</span><input id="node-search" type="search" placeholder="搜索节点 / 出口 IP" autocomplete="off"></label>
+      </div>
+      <div class="table-scroll" id="proxy-table" hidden><table class="proxy-table"><thead><tr><th scope="col">节点</th><th scope="col">出口 IP</th><th scope="col">地区</th><th scope="col">信誉分</th><th scope="col">状态</th><th scope="col">操作</th></tr></thead><tbody id="node-rows"></tbody></table></div>
+      <div class="empty-state" id="proxy-empty" hidden><h3 id="empty-title">尚未加载代理名单</h3><p id="empty-message">点击“更新代理名单”，加载全部地区已有 IP 记录的节点。</p></div>
+      <footer class="results-footer"><span id="node-count">正在读取…</span><div class="page-controls" id="proxy-pagination" hidden><button id="previous-nodes" type="button">上一页</button><span id="node-page">1 / 1</span><button id="next-nodes" type="button">下一页</button></div><span>每 3 秒自动更新</span></footer>
+    </section>
+  </main>
+</body>
+</html>

@@ -125,6 +125,33 @@ class AccountImportTests(unittest.TestCase):
 
 
 class ResultsTests(unittest.TestCase):
+    def test_inquiry_data_alone_does_not_prove_persona_identity_requirement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = collect(tmp, "first@example.invalid", {"authenticated":False, "verificationRequired":True,
+                           "failureStage":"wait_exchange", "errorMessage":"COM exchange not observed"})
+            self.assertEqual(data["status"], "failed")
+            self.assertNotIn("verificationRequirement", data["result"])
+
+    def test_account_verification_completes_without_claiming_authenticated_or_selected(self):
+        for flags, expected in (({"personaVerificationRequired":True}, "未进行身份验证"),
+                                ({"requiresHumanInteraction":True, "humanVerificationObservation":{"personaPageVisible":True}}, "未进行身份验证")):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "failure.png").write_bytes(PNG)
+                data = collect(tmp, "first@example.invalid", {"authenticated":False, **flags})
+                self.assertEqual(data["status"], "success")
+                self.assertIn(expected, data["result"]["verificationRequirement"])
+                self.assertIsNone(data["error"])
+                self.assertIsNone(data["selections"])
+                self.assertIsNone(data["cookie_header"])
+                self.assertEqual(data["screenshot"], PNG)
+                self.assertFalse(data["result"]["authenticated"])
+
+    def test_access_paused_stays_distinct_from_account_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = collect(tmp, "first@example.invalid", {"requiresHumanInteraction":True, "browsingActivityPaused":True})
+            self.assertEqual(data["status"], "failed")
+            self.assertIn("访问已暂停", data["result"]["verificationRequirement"])
+
     def test_selected_shows_and_no_selections_are_distinct_from_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
@@ -138,16 +165,28 @@ class ResultsTests(unittest.TestCase):
             self.assertEqual(selections_from_har(path, "first@example.invalid")[0], [])
             successful_run(path, "first@example.invalid", record="missing")
             data = collect(path, "first@example.invalid", summary)
-            self.assertEqual(data["status"], "partial")
+            self.assertEqual(data["status"], "success")
             self.assertIsNone(data["selections"])
+            self.assertIsNone(data["error"])
+            self.assertEqual(data["screenshot"], PNG)
+            self.assertIn("selectionWarning", data["result"])
 
-    def test_unknown_market_preserves_id_and_reports_partial(self):
+    def test_unknown_market_preserves_id_and_screenshot_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             summary = successful_run(tmp, "first@example.invalid", markets=[])
             data = collect(tmp, "first@example.invalid", summary)
-            self.assertEqual(data["status"], "partial")
+            self.assertEqual(data["status"], "success")
+            self.assertIsNone(data["error"])
             self.assertEqual(data["selections"][0]["id"], "m1")
             self.assertFalse(data["selections"][0]["resolved"])
+
+    def test_missing_screenshot_still_reports_partial_when_selections_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = successful_run(tmp, "first@example.invalid", record="missing")
+            (Path(tmp) / "com-result.png").unlink()
+            data = collect(tmp, "first@example.invalid", summary)
+            self.assertEqual(data["status"], "partial")
+            self.assertIn("整页截图未生成", data["error"])
 
     def test_claimed_success_without_matching_cookie_is_failed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -160,6 +199,108 @@ class ResultsTests(unittest.TestCase):
 
 
 class WebTests(unittest.TestCase):
+    def test_manual_proxy_restore_endpoint_recovers_only_node_and_requires_valid_request(self):
+        pool = fixture_pool(None)
+        for node in pool.nodes[:2]:
+            node["screening"] = {"exitIP":"192.0.2.1", "country":"US"}
+        pool.configure_reputation(self.store)
+        self.app.extensions["queries"].current_pool = pool
+        with pool.lease(exclude_ids=["1", "2"]) as proxy:
+            for _ in range(10):
+                pool.record_outcome(proxy, False)
+        self.assertEqual(pool.reputation_status()["disabled_nodes"], 1)
+        self.assertEqual(self.client.post("/api/proxies/restore", json={"node_id":"0"}).status_code, 403)
+        for body in ({}, {"node_id":123}, {"node_id":"unknown"}, []):
+            self.assertEqual(self.client.post("/api/proxies/restore", json=body, headers=self.headers).status_code, 400)
+        response = self.client.post("/api/proxies/restore", json={"node_id":"1"}, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["confidence"], 10)
+        self.assertEqual(pool.reputation_status()["disabled_nodes"], 1)
+        response = self.client.post("/api/proxies/restore", json={"node_id":"0"}, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(pool.reputation_status()["disabled_nodes"], 0)
+        self.assertEqual(self.store.proxy_reputations()["node:0"]["disabled_until"], 0)
+
+    def test_restore_all_disabled_proxies_requires_token_and_persists(self):
+        pool = fixture_pool(None)
+        pool.configure_reputation(self.store)
+        self.app.extensions["queries"].current_pool = pool
+        for index in ("0", "1", "2"):
+            with pool.lease(exclude_ids=[n for n in ("0", "1", "2") if n != index]) as proxy:
+                for _ in range(10 if index != "2" else 3):
+                    pool.record_outcome(proxy, False)
+        self.assertEqual(self.client.post("/api/proxies/restore-all").status_code, 403)
+        self.assertEqual(pool.reputation_status()["disabled_nodes"], 2)
+        response = self.client.post("/api/proxies/restore-all", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["restored"], 2)
+        self.assertEqual(pool.reputation_status()["disabled_nodes"], 0)
+        saved = self.store.proxy_reputations()
+        self.assertEqual(saved["node:0"], {"confidence":10, "disabled_until":0})
+        self.assertEqual(saved["node:1"], {"confidence":10, "disabled_until":0})
+        self.assertEqual(saved["node:2"]["confidence"], 7)
+        self.assertEqual(self.client.post("/api/proxies/restore-all", headers=self.headers).get_json()["restored"], 0)
+
+    def test_proxy_page_and_nodes_api_show_scores_without_credentials(self):
+        page = self.client.get("/proxies")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("代理池", page.get_data(as_text=True))
+        self.assertEqual(self.client.get("/api/proxies/nodes").get_json()["nodes"], [])
+        pool = fixture_pool(None)
+        pool.nodes[0]["screening"] = {"exitIP":"192.0.2.1", "country":"US"}
+        service = self.app.extensions["queries"]
+        service.current_pool = pool
+        with pool.lease(exclude_ids=["1", "2"]) as proxy:
+            busy = self.client.get("/api/proxies/nodes").get_json()
+            self.assertEqual(busy["nodes"][0]["status"], "in-use")
+            for _ in range(10):
+                pool.record_outcome(proxy, False)
+        response = self.client.get("/api/proxies/nodes")
+        data = response.get_json()
+        self.assertEqual(data["disabled_nodes"], 1)
+        self.assertEqual(data["nodes"][0]["confidence"], 0)
+        self.assertEqual(data["nodes"][0]["status"], "disabled")
+        self.assertEqual(data["nodes"][0]["exit_ip"], "192.0.2.1")
+        self.assertEqual(data["nodes"][0]["disabled_until"], -1)
+        for secret in ("username", "password", "socksHost", "test-only"):
+            self.assertNotIn(secret, response.get_data(as_text=True))
+
+    def test_legacy_inquiry_data_success_is_repaired_without_discarding_screenshot(self):
+        batch_id = self.store.create_batch([Account(1, "spinner@example.invalid", "fixture")], "legacy", DEFAULT_URL)
+        rid = self.store.runs(batch_id)[0]["id"]
+        self.store.finish_run(rid, {"status":"success", "screenshot":PNG, "result":{
+            "verificationRequired":True, "verificationRequirement":"未进行身份验证", "failureStage":"wait_exchange"}})
+        self.store.normalize_verification_results()
+        row = self.store.run(rid)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["screenshot"], PNG)
+        self.assertNotIn("verificationRequirement", json.loads(row["result"]))
+
+    def test_saved_verification_results_are_normalized_and_exposed_in_events_column(self):
+        accounts = [Account(1, "identity@example.invalid", "fixture"), Account(2, "paused@example.invalid", "fixture")]
+        batch_id = self.store.create_batch(accounts, "verification", DEFAULT_URL)
+        ids = [r["id"] for r in self.store.runs(batch_id)]
+        for rid, flags in zip(ids, ({"personaVerificationRequired":True}, {"requiresHumanInteraction":True, "browsingActivityPaused":True})):
+            self.store.finish_run(rid, {"status":"needs-human", "error":"old", "screenshot":PNG, "result":flags})
+        self.store.normalize_verification_results()
+        rows = self.store.runs(batch_id)
+        self.assertEqual([r["status"] for r in rows], ["success", "failed"])
+        self.assertEqual(rows[0]["verification_requirement"], "未进行身份验证")
+        self.assertIsNone(rows[0]["error"])
+        self.assertEqual(self.store.run(ids[0])["screenshot"], PNG)
+        from exports import results_csv
+        self.assertIn("未进行身份验证", results_csv(self.store.runs(batch_id, include_credentials=True)).decode("utf-8-sig"))
+
+    def test_manual_human_retry_api_resets_human_status(self):
+        batch_id = self.store.create_batch([Account(1, "human@example.invalid", "fixture")], "human", DEFAULT_URL)
+        run_id = self.store.runs(batch_id)[0]["id"]
+        self.store.finish_run(run_id, {"status":"needs-human", "error":"paused", "screenshot":PNG, "result":{}})
+        self.store.finish_batch(batch_id)
+        response = self.client.post(f"/api/batches/{batch_id}/retry", json={"scope":"human", "run_id":run_id}, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.store.run(run_id)["status"], "pending")
+        self.assertIsNone(self.store.run(run_id)["error"])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -200,7 +341,7 @@ class WebTests(unittest.TestCase):
     def test_api_proxy_filter_routes_to_cached_json_without_external_probes(self):
         service = self.app.extensions["queries"]
         pool = fixture_pool(DEFAULT_URL)
-        with patch("jobs.filtered_pool_from_api", return_value=pool) as load, patch("jobs.fresh_us_pool") as deep:
+        with patch("jobs.filtered_pool_from_api", return_value=pool) as load, patch("jobs.fresh_pool") as deep:
             response = self.client.post("/api/proxies/filter", json={"campaign":DEFAULT_URL}, headers=self.headers)
             self.assertEqual(response.status_code, 202)
             service.proxy_thread.join(timeout=5)
@@ -211,6 +352,20 @@ class WebTests(unittest.TestCase):
         self.assertEqual(service.proxy_status()["status"], "ready")
         self.assertEqual(self.client.post("/api/proxies/refresh", json={"mode":"invalid"}, headers=self.headers).status_code, 400)
         self.assertIn(b'id="filter-proxies"', self.client.get("/").data)
+
+    def test_default_proxy_refresh_loads_all_regions_without_prechecks(self):
+        pool=fixture_pool(DEFAULT_URL)
+        for node,country in zip(pool.nodes,("HK","JP","TW")):
+            node["screening"]={"country":country,"exitIP":"192.0.2."+str(int(node["id"])+1)}
+        service=self.app.extensions["queries"]
+        with patch("jobs.filtered_pool_from_api",return_value=pool) as load, patch("jobs.fresh_pool") as deep:
+            response=self.client.post("/api/proxies/refresh",json={"campaign":DEFAULT_URL},headers=self.headers)
+            self.assertEqual(response.status_code,202)
+            service.proxy_thread.join(timeout=5)
+            load.assert_called_once()
+            deep.assert_not_called()
+        self.assertEqual(service.pool_mode,"api")
+        self.assertEqual({n["country"] for n in service.proxy_nodes()["nodes"]},{"HK","JP","TW"})
 
     def test_proxy_refresh_is_async_requires_token_and_coalesces_duplicate_clicks(self):
         service = self.app.extensions["queries"]
@@ -717,7 +872,7 @@ class JobTests(unittest.TestCase):
             return successful_run(out, email) if len(calls) == 7 else {"authenticated":False, "passwordStatus":403}
         batch_id = self.store.create_batch(self.accounts[:1], "continuous", DEFAULT_URL, 1)
         service = self.service(self.store, execute=execute, delay=0)
-        with patch("jobs.fresh_us_pool") as refresh:
+        with patch("jobs.fresh_pool") as refresh:
             service.set_continuous_retry(batch_id, True)
             self.wait(service)
             refresh.assert_not_called()
@@ -726,6 +881,44 @@ class JobTests(unittest.TestCase):
         self.assertEqual(self.store.runs(batch_id)[0]["status"], "success")
         self.assertEqual(self.store.batch(batch_id)["continuous_retry"], 0)
         self.assertEqual(len(self.store.runs(batch_id)), 1)
+
+    @patch("jobs.CONTINUOUS_RETRY_DELAY", 0.01)
+    @patch("jobs.browser_command", return_value=(["node"], False))
+    def test_continuous_retry_goes_behind_unprocessed_accounts(self, _):
+        calls = []
+        batch_id = self.store.create_batch(self.accounts[:3], "fair-retry", DEFAULT_URL, 1)
+        def execute(email, password, out, *args, **kwargs):
+            calls.append(email)
+            row = next(r for r in self.store.runs(batch_id) if r["email"] == email)
+            self.assertEqual(row["attempt_count"], 1)
+            if email == self.accounts[0].email and calls.count(email) == 1:
+                return {"authenticated":False, "passwordStatus":403}
+            return successful_run(out, email)
+        service = self.service(self.store, execute=execute, delay=0)
+        service.set_continuous_retry(batch_id, True)
+        self.wait(service)
+        self.assertEqual(calls, [a.email for a in self.accounts[:3]] + [self.accounts[0].email])
+        self.assertEqual({r["status"] for r in self.store.runs(batch_id)}, {"success"})
+
+    @patch("jobs.CONTINUOUS_RETRY_DELAY", 0.01)
+    @patch("jobs.browser_command", return_value=(["node"], False))
+    def test_continuous_retry_with_only_one_exit_can_take_another_queue_turn(self, _):
+        calls = []
+        pool = ProxyPool([{"id":"single", "username":"route", "screening":{"exitIP":"192.0.2.1"}}],
+                         "127.0.0.1", 10801, "fixture")
+        def execute(email, password, out, *args, **kwargs):
+            calls.append(email)
+            if len(calls) == 1:
+                return {"authenticated":False, "passwordStatus":403}
+            return successful_run(out, email)
+        batch_id = self.store.create_batch(self.accounts[:1], "single-exit-requeue", DEFAULT_URL, 1)
+        service = self.service(self.store, execute=execute, pool_factory=lambda _:pool, delay=0)
+        service.set_continuous_retry(batch_id, True)
+        self.wait(service)
+        self.assertEqual(len(calls), 2)
+        row = self.store.runs(batch_id)[0]
+        self.assertEqual((row["status"], row["attempt_count"]), ("success", 1))
+        self.assertEqual(pool.leased, set())
 
     @patch("jobs.CONTINUOUS_RETRY_DELAY", 10)
     @patch("jobs.browser_command", return_value=(["node"], False))
@@ -740,7 +933,7 @@ class JobTests(unittest.TestCase):
         self.wait_status(self.store.runs(batch_id)[0]["id"], "failed")
         service.set_continuous_retry(batch_id, False)
         self.wait(service)
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(self.store.runs(batch_id)[0]["status"], "failed")
         self.assertEqual(self.store.batch(batch_id)["continuous_retry"], 0)
 
@@ -788,7 +981,7 @@ class JobTests(unittest.TestCase):
             return successful_run(out, email)
         batch_id = self.store.create_batch(self.accounts, "resize", DEFAULT_URL, 1)
         service = self.service(self.store, execute=execute, delay=0)
-        with patch("jobs.fresh_us_pool") as refresh:
+        with patch("jobs.fresh_pool") as refresh:
             service.start(batch_id)
             try:
                 self.assertTrue(started[0].wait(timeout=3))
@@ -822,7 +1015,7 @@ class JobTests(unittest.TestCase):
         self.store.finish_batch(batch_id)
         original_run, original_batch = self.store.run(run_id), self.store.batch(batch_id)
         service = QueryService(self.store)
-        with patch("jobs.fresh_us_pool") as refresh:
+        with patch("jobs.fresh_pool") as refresh:
             with self.assertRaisesRegex(ValueError, "请先点击"):
                 service.retry(batch_id, start=True)
             refresh.assert_not_called()
@@ -833,7 +1026,7 @@ class JobTests(unittest.TestCase):
         batch_id = self.store.create_batch(self.accounts[:1], "other-campaign", DEFAULT_URL)
         service = self.service(self.store)
         service.pool_campaign = DEFAULT_URL + "?different=1"
-        with patch("jobs.fresh_us_pool") as refresh:
+        with patch("jobs.fresh_pool") as refresh:
             with self.assertRaisesRegex(ValueError, "请先点击"):
                 service.start(batch_id)
             refresh.assert_not_called()
@@ -849,7 +1042,7 @@ class JobTests(unittest.TestCase):
             return successful_run(out, email) if proxy.node["id"] == "new" else {"authenticated":False}
         batch_id = self.store.create_batch(self.accounts[:1], "fresh", DEFAULT_URL)
         service = QueryService(self.store, execute=execute, delay=0)
-        with patch("jobs.fresh_us_pool", side_effect=pools) as refresh:
+        with patch("jobs.fresh_pool", side_effect=pools) as refresh:
             with self.assertRaisesRegex(ValueError, "请先点击"):
                 service.start(batch_id)
             self.assertEqual(refresh.call_count, 0)
@@ -881,7 +1074,7 @@ class JobTests(unittest.TestCase):
             if email == self.accounts[0].email:
                 release.wait(timeout=8)
                 self.assertEqual(proxy.upstream["password"], "old")
-            elif len(calls[email]) <= 3:
+            elif len(calls[email]) == 1:
                 return {"authenticated":False, "passwordStatus":403}
             return successful_run(out, email)
         batch_id = self.store.create_batch(self.accounts[:2], "live-fresh", DEFAULT_URL, 2)
@@ -928,7 +1121,7 @@ class JobTests(unittest.TestCase):
             service.proxy_thread.join(timeout=5)
             with self.assertRaisesRegex(ValueError, "手动刷新"):
                 service.retry(batch_id, run_id=ids[1], start=True)
-            self.assertEqual(calls.count(self.accounts[1].email), 3)
+            self.assertEqual(calls.count(self.accounts[1].email), 1)
             self.assertEqual(self.store.run(ids[1]), original)
             self.assertEqual(service.proxy_status()["status"], "failed")
             self.assertEqual(self.store.run(ids[0])["status"], "running")
@@ -945,7 +1138,7 @@ class JobTests(unittest.TestCase):
             raise InterruptedError("cancelled")
         batch_id = self.store.create_batch(self.accounts[:2], "cancel-screen", DEFAULT_URL)
         service = QueryService(self.store)
-        with patch("jobs.fresh_us_pool", side_effect=screening):
+        with patch("jobs.fresh_pool", side_effect=screening):
             service.refresh_proxies(DEFAULT_URL)
             self.assertTrue(entered.wait(timeout=2))
             service.shutdown()
@@ -964,7 +1157,7 @@ class JobTests(unittest.TestCase):
             calls[email] = calls.get(email, 0) + 1
             if email == self.accounts[0].email:
                 release.wait(timeout=8)
-            if email == self.accounts[1].email and calls[email] <= 3:
+            if email == self.accounts[1].email and calls[email] == 1:
                 return {"authenticated":False, "passwordStatus":403}
             return successful_run(out, email)
         service = self.service(self.store, execute=execute, pool_factory=fixture_pool, delay=0)
@@ -981,7 +1174,7 @@ class JobTests(unittest.TestCase):
             self.assertEqual(self.store.batch(batch_id)["concurrency"], 2)
             self.assertIs(list(service.threads.values())[-1], original_thread)
             self.assertEqual(self.store.run(ids[2]), preserved)
-            self.assertEqual(calls[self.accounts[1].email], 4)
+            self.assertEqual(calls[self.accounts[1].email], 2)
             self.assertEqual(self.store.run(ids[1])["attempt_count"], 1)
         finally:
             release.set()
@@ -1024,7 +1217,7 @@ class JobTests(unittest.TestCase):
         ids = [row["id"] for row in self.store.runs(batch_id)]
         def execute(email, password, out, *args, **kwargs):
             calls.append(email)
-            if email == self.accounts[0].email and calls.count(email) <= 3:
+            if email == self.accounts[0].email and calls.count(email) == 1:
                 return {"authenticated":False, "passwordStatus":403}
             if email == self.accounts[1].email:
                 held.set()
@@ -1041,7 +1234,7 @@ class JobTests(unittest.TestCase):
         finally:
             release.set()
             self.wait(service)
-        self.assertEqual(calls, [self.accounts[0].email] * 3 + [self.accounts[1].email, self.accounts[0].email, self.accounts[2].email])
+        self.assertEqual(calls, [self.accounts[0].email] + [self.accounts[1].email, self.accounts[0].email, self.accounts[2].email])
         self.assertEqual({r["status"] for r in self.store.runs(batch_id)}, {"success"})
 
     @patch("jobs.browser_command", return_value=(["node"], False))
@@ -1063,7 +1256,7 @@ class JobTests(unittest.TestCase):
         service.retry(batch_id, run_id=ids[0], start=True)
         service.cancel(batch_id)
         self.wait(service)
-        self.assertEqual(calls, [self.accounts[0].email] * 3 + [self.accounts[1].email])
+        self.assertEqual(calls, [self.accounts[0].email] + [self.accounts[1].email])
         self.assertEqual({r["status"] for r in self.store.runs(batch_id)}, {"cancelled"})
 
     @patch("jobs.browser_command", return_value=(["node"], False))
@@ -1083,7 +1276,7 @@ class JobTests(unittest.TestCase):
             original_finish(*args, **kwargs)
         def execute(email, password, out, *args, **kwargs):
             calls.append(email)
-            if len(calls) <= 3:
+            if len(calls) == 1:
                 return {"authenticated":False, "passwordStatus":403}
             retried.set()
             release_retry.wait(timeout=8)
@@ -1112,10 +1305,27 @@ class JobTests(unittest.TestCase):
                 release_retry.set()
                 self.wait(service)
         self.assertEqual(self.store.run(run_id)["status"], "success")
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 2)
 
     @patch("jobs.browser_command", return_value=(["node"], False))
-    def test_automatic_retry_changes_proxy_and_stops_when_successful(self, _):
+    def test_screenshot_success_skips_all_retries_when_selections_are_incomplete(self, _):
+        for record, markets in (("missing", None), ("selected", [])):
+            with self.subTest(record=record):
+                calls = []
+                def execute(email, password, out, *args, **kwargs):
+                    calls.append(email)
+                    return successful_run(out, email, record=record, markets=markets)
+                batch_id = self.store.create_batch(self.accounts[:1], "screenshot", DEFAULT_URL)
+                service = self.service(self.store, execute=execute, delay=0)
+                service.set_continuous_retry(batch_id, True)
+                self.wait(service)
+                row = self.store.run(self.store.runs(batch_id)[0]["id"])
+                self.assertEqual((row["status"], row["attempt_count"]), ("success", 1))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(row["screenshot"], PNG)
+
+    @patch("jobs.browser_command", return_value=(["node"], False))
+    def test_manual_requeue_starts_a_new_single_attempt_and_cleans_previous_result(self, _):
         calls, paths = [], []
         batch_id = self.store.create_batch(self.accounts[:1], "retry", DEFAULT_URL)
         run_id = self.store.runs(batch_id)[0]["id"]
@@ -1124,17 +1334,23 @@ class JobTests(unittest.TestCase):
             paths.append(out)
             record = self.store.run(run_id)
             self.assertEqual(record["status"], "running")
-            self.assertEqual(record["attempt_count"], len(calls))
+            self.assertEqual(record["attempt_count"], 1)
             self.assertIsNone(record["screenshot"])
             if len(calls) == 1:
                 return {"authenticated":False, "failureStage":"password_once", "passwordStatus":403}
             return successful_run(out, email)
         service = self.service(self.store, execute=execute, pool_factory=fixture_pool, delay=0)
         service.start(batch_id); self.wait(service)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.store.run(run_id)["status"], "failed")
+        service.retry(batch_id, run_id=run_id, start=True); self.wait(service)
         self.assertEqual(len(calls), 2)
-        self.assertNotEqual(calls[0], calls[1])
+
+        scores = service.current_pool.reputation_status()["reputations"]
+        self.assertEqual(next(r["confidence"] for r in scores if r["route"] == "node:" + calls[0]), 9)
+        self.assertEqual(next(r["confidence"] for r in scores if r["route"] == "node:" + calls[1]), 10)
         record = self.store.run(run_id)
-        self.assertEqual((record["status"], record["attempt_count"]), ("success", 2))
+        self.assertEqual((record["status"], record["attempt_count"]), ("success", 1))
         self.assertEqual(json.loads(record["result"])["proxyNode"]["id"], calls[-1])
         self.assertEqual(len(self.store.batches()), 1)
         self.assertEqual(len(self.store.runs(batch_id)), 1)
@@ -1142,7 +1358,7 @@ class JobTests(unittest.TestCase):
         self.assertTrue(all(not path.exists() for path in paths))
 
     @patch("jobs.browser_command", return_value=(["node"], False))
-    def test_automatic_retry_stops_after_three_attempts_and_keeps_only_last_result(self, _):
+    def test_partial_screenshot_result_is_kept_without_internal_login_retries(self, _):
         calls = []
         batch_id = self.store.create_batch(self.accounts[:1], "retry", DEFAULT_URL)
         def execute(email, password, out, *args, proxy=None, **kwargs):
@@ -1150,23 +1366,22 @@ class JobTests(unittest.TestCase):
             if len(calls) == 1:
                 summary = successful_run(out, email)
                 (out / "com-result.png").unlink()
-                return summary  # Partial result with a verified Cookie must also be replaced.
+                return summary  # Keep the audited Cookie when the screenshot is missing.
             return {"authenticated":False, "failureStage":"password_once", "passwordStatus":403}
         service = self.service(self.store, execute=execute, pool_factory=fixture_pool, delay=0)
         service.start(batch_id); self.wait(service)
         record = self.store.run(self.store.runs(batch_id)[0]["id"])
-        self.assertEqual(len(calls), 3)
-        self.assertTrue(all(a != b for a, b in zip(calls, calls[1:])))
-        self.assertEqual((record["status"], record["attempt_count"]), ("failed", 3))
-        self.assertIn("已尝试 3 次", record["error"])
-        self.assertIn("403", record["error"])
-        self.assertIsNone(record["cookie_header"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((record["status"], record["attempt_count"]), ("partial", 1))
+        self.assertNotIn("已尝试 3 次", record["error"] or "")
+
+        self.assertIsNotNone(record["cookie_header"])
         self.assertIsNone(record["screenshot"])
-        self.assertIsNone(record["selections"])
-        self.assertEqual(json.loads(record["result"])["attempts"], 3)
+        self.assertIsNotNone(record["selections"])
+        self.assertEqual(json.loads(record["result"])["attempts"], 1)
 
     @patch("jobs.browser_command", return_value=(["node"], False))
-    def test_automatic_retry_recovers_from_runner_exception(self, _):
+    def test_runner_exception_finishes_after_one_attempt(self, _):
         calls = []
         def execute(email, password, out, *args, proxy=None, **kwargs):
             calls.append(proxy.node["id"])
@@ -1176,12 +1391,12 @@ class JobTests(unittest.TestCase):
         batch_id = self.store.create_batch(self.accounts[:1], "exception", DEFAULT_URL)
         service = self.service(self.store, execute=execute, pool_factory=fixture_pool, delay=0)
         service.start(batch_id); self.wait(service)
-        self.assertEqual(len(calls), 2)
-        self.assertNotEqual(*calls)
-        self.assertEqual(self.store.runs(batch_id)[0]["status"], "success")
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("private-credentials", self.store.runs(batch_id)[0]["error"])
+        self.assertEqual(self.store.runs(batch_id)[0]["status"], "failed")
 
     @patch("jobs.browser_command", return_value=(["node"], False))
-    def test_automatic_retry_stops_if_no_other_exit_is_available(self, _):
+    def test_single_exit_failure_finishes_without_internal_retry(self, _):
         calls = []
         def pool(_):
             return ProxyPool([{"id":str(i), "username":str(i), "screening":{"exitIP":"192.0.2.1"}} for i in range(2)], "127.0.0.1", 10801, "fixture")
@@ -1194,8 +1409,23 @@ class JobTests(unittest.TestCase):
         record = self.store.run(self.store.runs(batch_id)[0]["id"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(record["attempt_count"], 1)
-        self.assertIn("没有其他可用的代理出口", record["error"])
-        self.assertEqual(json.loads(record["result"])["retryStopReason"], "no_alternative_proxy")
+        self.assertIn("403", record["error"])
+        self.assertNotIn("retryStopReason", json.loads(record["result"]))
+
+    @patch("jobs.browser_command", return_value=(["node"], False))
+    def test_identity_requirement_completes_but_access_pause_fails_once(self, _):
+        for flags, expected, attempts in (({"personaVerificationRequired":True}, "success", 1),
+                                           ({"requiresHumanInteraction":True, "browsingActivityPaused":True}, "failed", 1)):
+            with self.subTest(flags=flags):
+                calls = []
+                def execute(*args, **kwargs):
+                    calls.append(1)
+                    return {"authenticated":False, **flags}
+                batch_id = self.store.create_batch(self.accounts[:1], "verification", DEFAULT_URL)
+                service = self.service(self.store, execute=execute, delay=0)
+                service.start(batch_id); self.wait(service)
+                self.assertEqual(self.store.runs(batch_id)[0]["status"], expected)
+                self.assertEqual(len(calls), attempts)
 
     @patch("jobs.browser_command", return_value=(["node"], False))
     def test_automatic_retry_does_not_continue_after_human_verification_or_cancellation(self, _):
@@ -1236,10 +1466,10 @@ class JobTests(unittest.TestCase):
         service.start(batch_id); self.wait(service)
         self.assertEqual(len(calls), 3)
         for selected in calls.values():
-            self.assertEqual(len(selected), 3)
+            self.assertEqual(len(selected), 1)
             self.assertTrue(all(a != b for a, b in zip(selected, selected[1:])))
         self.assertEqual(pool.leased, set())
-        self.assertEqual({row["attempt_count"] for row in self.store.runs(batch_id)}, {3})
+        self.assertEqual({row["attempt_count"] for row in self.store.runs(batch_id)}, {1})
 
     @patch("jobs.browser_command", return_value=(["node"], False))
     def test_three_concurrent_accounts_are_isolated_and_temporary_files_removed(self, _):
@@ -1276,15 +1506,17 @@ class JobTests(unittest.TestCase):
     def test_more_than_six_accounts_can_run_together_when_nodes_are_available(self, _):
         barrier = threading.Barrier(8)
         def execute(email, password, out, *args, **kwargs):
-            barrier.wait(timeout=5)
+            barrier.wait(timeout=30)
             return successful_run(out, email)
         def eight_nodes(_):
             return ProxyPool([{"id":str(i), "name":f"node-{i}", "username":str(i)} for i in range(8)], "127.0.0.1", 10801, "test")
         accounts = [Account(i + 1, f"parallel{i}@example.invalid", "test") for i in range(8)]
         service = self.service(self.store, execute=execute, pool_factory=eight_nodes, delay=0)
+        self.addCleanup(service.shutdown)
         batch_id = self.store.create_batch(accounts, "eight", DEFAULT_URL, 8)
         service.start(batch_id)
-        self.wait(service)
+        service.threads[batch_id].join(timeout=60)
+        self.assertFalse(service.threads[batch_id].is_alive())
         self.assertEqual(self.store.batch(batch_id)["effective_concurrency"], 8)
         self.assertEqual({row["status"] for row in self.store.runs(batch_id)}, {"success"})
 
@@ -1417,7 +1649,7 @@ class JobTests(unittest.TestCase):
         self.assertIn("SQLITE_BUSY", self.store.batch(batch_id)["error"])
         self.assertEqual(self.store.runs(batch_id)[0]["stage"], "service")
 
-    def test_human_status_is_preserved_by_all_retry_paths(self):
+    def test_human_status_is_preserved_by_ordinary_retry_paths(self):
         batch_id = self.store.create_batch(self.accounts[:1], "human-skip", DEFAULT_URL)
         run_id = self.store.runs(batch_id)[0]["id"]
         self.store.finish_run(run_id, {"status":"needs-human", "screenshot":PNG, "result":{}})
@@ -1435,6 +1667,35 @@ class JobTests(unittest.TestCase):
                     service.retry(batch_id, start=live, **options)
                 self.assertEqual(self.store.run(run_id), original)
         service.active = {}
+
+    def test_explicit_human_retry_resets_only_selected_human_rows(self):
+        for live in (False, True):
+            for single in (False, True):
+                with self.subTest(live=live, single=single):
+                    batch_id = self.store.create_batch(self.accounts[:5], "manual-human", DEFAULT_URL)
+                    ids = [r["id"] for r in self.store.runs(batch_id)]
+                    for run_id, status in zip(ids, ("needs-human", "needs-human", "failed", "success", "running")):
+                        self.store.finish_run(run_id, {"status":status, "screenshot":PNG, "error":"old", "result":{}})
+                    self.store.finish_batch(batch_id)
+                    service = self.service(self.store)
+                    if live:
+                        service.active[batch_id] = threading.Event()
+                        service.retry_queues[batch_id] = deque()
+                        with self.store.connect(write=True) as db:
+                            db.execute("UPDATE batches SET status='running' WHERE id=?", (batch_id,))
+                    untouched = {rid:self.store.run(rid) for rid in (ids[1:] if single else ids[2:])}
+                    service.retry(batch_id, run_id=ids[0] if single else None, scope="human", start=live)
+                    targets = ids[:1] if single else ids[:2]
+                    for rid in targets:
+                        row = self.store.run(rid)
+                        self.assertEqual(row["status"], "pending")
+                        self.assertEqual(row["attempt_count"], 0)
+                        self.assertIsNone(row["error"])
+                        self.assertIsNone(row["screenshot"])
+                    for rid, original in untouched.items():
+                        self.assertEqual(self.store.run(rid), original)
+                    if live:
+                        self.assertEqual(set(service.retry_queues[batch_id]), set(targets))
 
     def test_single_account_retry_only_resets_the_requested_row(self):
         batch_id = self.store.create_batch(self.accounts[:2], "single", DEFAULT_URL)

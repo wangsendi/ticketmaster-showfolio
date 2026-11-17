@@ -80,7 +80,7 @@ def results_csv(rows, screenshots=None):
     writer.writerow(columns)
     for row in rows:
         selected = row["selections"]
-        fields = [row["email"], row["password"], row["status"], "；".join(v["name"] for v in selected) if selected is not None else "未取得场次",
+        fields = [row["email"], row["password"], row["status"], row.get("verification_requirement") or ("；".join(v["name"] for v in selected) if selected is not None else "未取得场次"),
                   row["error"] or "", row["finished_at"] or "", row["cookie_header"] or ""]
         if screenshots is not None:
             fields.extend(screenshots.get(row["id"], ("", "无截图")))
@@ -196,7 +196,7 @@ def _results_workbook(store, batch_id, *, rows, destination=None, on_progress=No
             with store.connect() as db:
                 for row_number, row in enumerate(rows, 2):
                     selected = row["selections"]
-                    events = "未取得场次" if selected is None else "\n".join(v["name"] for v in selected) or "未选择场次"
+                    events = row.get("verification_requirement") or ("未取得场次" if selected is None else "\n".join(v["name"] for v in selected) or "未选择场次")
                     cookie = excel_text(row["cookie_header"] or "", credential=True)
                     values = [row["email"], row["password"], states.get(row["status"], row["status"]), events, "暂无截图", "无截图",
                               row["error"] or "", row["finished_at"] or ""]

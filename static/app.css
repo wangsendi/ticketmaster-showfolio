@@ -18,3 +18,8 @@
 .results-footer{align-items:center;gap:10px;flex-wrap:wrap}.page-controls{display:flex;align-items:center;gap:10px}.page-controls button{border:1px solid var(--line);background:#fff;border-radius:5px;color:var(--ink);font-size:10px;line-height:16px;padding:5px 8px}.page-controls button:hover:not(:disabled){background:var(--soft)}.page-controls button:disabled{cursor:default}.page-controls span{font-variant-numeric:tabular-nums}
 
 .proxy-toolbar{flex-wrap:wrap}.proxy-toolbar #proxy-status{flex-basis:100%}
+
+/* Account status filters wrap independently of the email search field. */
+.app-nav{display:flex;align-items:center;gap:24px;font-size:12px;white-space:nowrap}.app-nav a{padding:10px 0;border-bottom:2px solid transparent;color:var(--muted);transition:color .15s,border-color .15s}.app-nav a:hover,.app-nav a[aria-current=page]{color:var(--accent);border-color:var(--accent)}@media(max-width:540px){.app-nav{gap:16px;font-size:11px}.topbar .brand span:last-child{display:none}.topbar .brand-rule{display:none}}
+.table-toolbar{flex-wrap:wrap}.filters{flex:1 1 520px;min-width:0;flex-wrap:wrap}.filters button{display:inline-flex;align-items:center;justify-content:center;gap:5px;flex:0 0 auto}.filter-count{font-size:10px;font-variant-numeric:tabular-nums;opacity:.75}.search-label{flex:0 0 180px}
+@media(max-width:540px){.filters{flex-basis:100%;gap:4px}.filters button{padding:7px 8px}.search-label{flex-basis:100%}}

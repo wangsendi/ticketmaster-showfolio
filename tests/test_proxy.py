@@ -54,13 +54,13 @@ class ProxyTests(unittest.TestCase):
         with patch("proxy_check.request") as probe:
             pool = filtered_pool_from_api(self.url, DEFAULT_URL)
             probe.assert_not_called()
-        self.assertEqual([n["id"] for n in pool.nodes], ["0"])
+        self.assertEqual([n["id"] for n in pool.nodes], ["0", "1"])
         self.assertEqual(pool.nodes[0]["screening"]["exitIP"], "192.0.2.1")
         self.assertEqual(self.requests, ["/api/nodes", "/api/config"])
         self.assertNotIn("do-not-retain", str(pool.nodes))
         self.assertNotIn("private-outbound", str(pool.nodes))
 
-    def test_api_filter_skips_unchecked_invalid_and_unselected_nodes(self):
+    def test_api_filter_skips_unchecked_and_invalid_nodes(self):
         from proxy_check import filtered_pool_from_api
         for address in (None, "invalid-ip", 123):
             self.payload["items"][0]["ip_check"] = {"data":{"ip_info":{"country_code":"US","ip":address}}}
@@ -68,7 +68,7 @@ class ProxyTests(unittest.TestCase):
                 filtered_pool_from_api(self.url, DEFAULT_URL)
             probe.assert_not_called()
 
-    def test_api_filter_accepts_us_sg_au_with_correct_country_metadata(self):
+    def test_api_loads_all_regions_with_correct_country_metadata(self):
         from proxy_check import filtered_pool_from_api
         for i, country in enumerate(("US", "SG", "AU")):
             self.payload["items"][i]["ip_check"] = {"data":{"ip_info":{"country_code":country,"ip":f"192.0.2.{i+1}"}}}
@@ -78,8 +78,8 @@ class ProxyTests(unittest.TestCase):
         with patch("proxy_check.request") as probe:
             pool = filtered_pool_from_api(self.url, DEFAULT_URL)
             probe.assert_not_called()
-        self.assertEqual({n["screening"]["country"] for n in pool.nodes}, {"US","SG","AU"})
-        self.assertEqual(len(pool.nodes), 3)
+        self.assertEqual({n["screening"]["country"] for n in pool.nodes}, {"US","SG","AU","HK","JP","CA","TW"})
+        self.assertEqual(len(pool.nodes), 7)
         self.assertEqual(self.requests, ["/api/nodes", "/api/config"])
 
     def test_random_cycles_preserve_node_routing_and_hide_credentials(self):
@@ -155,6 +155,18 @@ class ProxyTests(unittest.TestCase):
             selected = pool.select()
             self.assertEqual(selected.node["id"], "1")
             self.assertEqual(selected.node["screening"]["country"], "US")
+
+    def test_all_region_report_keeps_per_node_exit_metadata(self):
+        pool=ProxyPool.from_api(self.url)
+        report={"version":1,"complete":True,"nodesAPI":self.url,"campaignURL":DEFAULT_URL,
+                "country":None,"nodeIds":["0","1"],"results":[
+                    {"accepted":True,"node":{"id":str(i)},"exitAfterCampaign":{"ip":f"192.0.2.{i+1}","country":country}}
+                    for i,country in enumerate(("HK","JP"))]}
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"report.json"
+            path.write_text(json.dumps(report))
+            pool.restrict(path,self.url,DEFAULT_URL)
+        self.assertEqual({n["screening"]["country"] for n in pool.nodes},{"HK","JP"})
 
     def test_invalid_or_empty_reports_never_enable_all_nodes(self):
         base = {"version": 1, "complete": True, "nodesAPI": self.url, "campaignURL": DEFAULT_URL,

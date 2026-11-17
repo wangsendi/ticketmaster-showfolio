@@ -17,16 +17,18 @@ BROWSER_CONFIG = ROOT / "data/browser.json"
 
 
 def selected_browser():
-    config_path = Path(os.environ.get("TM_BROWSER_CONFIG", BROWSER_CONFIG))
-    try:
-        config = json.loads(config_path.read_text())
-        name = config["browser"]
-        if not isinstance(name, str):
-            raise ValueError()
-    except FileNotFoundError:
-        name = os.environ.get("TM_BROWSER", "cloakbrowser")
-    except (ValueError, KeyError, TypeError):
-        raise ValueError("浏览器配置文件无效，请检查 data/browser.json。") from None
+    name = os.environ.get("TM_BROWSER_OVERRIDE")
+    if name is None:
+        config_path = Path(os.environ.get("TM_BROWSER_CONFIG", BROWSER_CONFIG))
+        try:
+            config = json.loads(config_path.read_text())
+            name = config["browser"]
+            if not isinstance(name, str):
+                raise ValueError()
+        except FileNotFoundError:
+            name = os.environ.get("TM_BROWSER", "cloakbrowser")
+        except (ValueError, KeyError, TypeError):
+            raise ValueError("浏览器配置文件无效，请检查 data/browser.json。") from None
     name = name.strip().lower()
     if name not in ("cloakbrowser", "firefox", "chromium", "chrome"):
         raise ValueError("TM_BROWSER / 浏览器配置必须是 cloakbrowser、firefox、chromium 或 chrome。")
@@ -132,7 +134,7 @@ def run_account(email, password, out, command, use_xvfb, url, metadata=None, sto
     with (out / "login.reserved").open("x", encoding="utf-8") as handle:
         handle.write("one browser account attempt\n")
     source_hashes = {}
-    for name in ("runner.py", "jobs.py", "results.py", "proxy_pool.py", "src/login.cjs", "src/browser.cjs", "src/login-navigation.cjs", "src/proxy-bridge.cjs", "verify.py"):
+    for name in ("runner.py", "jobs.py", "results.py", "proxy_pool.py", "src/login.cjs", "src/browser.cjs", "src/login-navigation.cjs", "src/proxy-bridge.cjs", "src/persona.cjs", "verify.py"):
         source = ROOT / name
         source_hashes[name] = hashlib.sha256(source.read_bytes()).hexdigest()
     context = {"browser": browser, "headless": False, "usesXvfb": use_xvfb,
@@ -146,7 +148,7 @@ def run_account(email, password, out, command, use_xvfb, url, metadata=None, sto
     (out / "run-context.json").write_text(json.dumps(context, indent=2) + "\n", encoding="utf-8")
     data = {"email": email, "password": password, "outputDirectory": str(out),
             "startURL": url, "usesXvfb": use_xvfb, "browser": browser,
-            "locale": "en-GB", "timezoneId": "Europe/London"}
+            "locale": "zh-CN", "timezoneId": "Europe/London"}
     if stop_file:
         data["stopFile"] = str(stop_file)
     if proxy:
@@ -207,7 +209,7 @@ def run_account(email, password, out, command, use_xvfb, url, metadata=None, sto
         return browser_failure(out, stderr, process.returncode, proxy)
     keys = ("authenticated", "browser", "browserVersion", "emailStatus", "passwordStatus",
             "exchangeCOMObserved", "fanIsLoggedIn", "fanAccountMatches", "fanEntryRecordPresent",
-            "requiresHumanInteraction", "verificationRequired", "failureStage", "errorType", "loginReloads",
+            "requiresHumanInteraction", "verificationRequired", "personaVerificationRequired", "inquiryDataObserved", "failureStage", "errorType", "loginReloads",
             "proxyNode", "networkMode", "errorMessage", "loginCompleted", "screenshotFullPage", "screenshotHeight", "screenshotWidth")
     summary = {key: result[key] for key in keys if key in result}
     summary["outputDirectory"] = str(out)
