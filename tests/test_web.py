@@ -1723,6 +1723,34 @@ class JobTests(unittest.TestCase):
             self.assertEqual(self.store.batch(batch_id), original_batch)
             self.assertEqual(self.store.run(run_id), original_record)
 
+    @patch("jobs.CONTINUOUS_RETRY_DELAY", 0.01)
+    @patch("jobs.browser_command", return_value=(["node"], False))
+    def test_terminal_account_issues_stop_continuous_retry_without_penalizing_proxy(self, _):
+        evidence = [
+            {"emailStatus":404,"emailBusinessError":{"message":"The user is not found"}},
+            {"passwordResetRequired":True,"requiresHumanInteraction":True},
+            {"passwordFormBeforeSubmit":{"valueLength":7,"submitEnabled":False}},
+        ]
+        calls = []
+        accounts = self.accounts[:3]
+        by_email = {account.email:item for account,item in zip(accounts,evidence)}
+        def execute(email,password,out,*args,**kwargs):
+            calls.append(email)
+            Path(out).mkdir(parents=True,exist_ok=True)
+            (Path(out)/"failure.png").write_bytes(PNG)
+            return {"authenticated":False,**by_email[email]}
+        batch_id = self.store.create_batch(accounts,"terminal-issues",DEFAULT_URL,1)
+        service = self.service(self.store,execute=execute,delay=0)
+        self.addCleanup(service.shutdown)
+        service.set_continuous_retry(batch_id,True)
+        self.wait(service)
+        self.assertEqual(calls,[a.email for a in accounts])
+        self.assertEqual({r["status"] for r in self.store.runs(batch_id)},{"success"})
+        self.assertEqual(self.store.batch(batch_id)["continuous_retry"],0)
+        self.assertEqual([r["verification_requirement"] for r in self.store.runs(batch_id)],
+                         ["账号不存在","需要重置密码","密码仅7位，登录按钮不可用，请核对密码"])
+        self.assertTrue(all(n["confidence"]==10 for n in service.current_pool.reputation_status(include_nodes=True)["nodes"]))
+
 
 
 if __name__ == "__main__":

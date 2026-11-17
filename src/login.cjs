@@ -2,7 +2,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { assertBrowserInstalled, configuredBrowser, createBrowserContext, DEFAULT_LOCALE } = require("./browser.cjs");
-const { capturePageWithRefresh } = require("./capture.cjs");
+const { capturePageWithRefresh, ensureAccountPageWithRefresh } = require("./capture.cjs");
+const { submitAndWaitForResponse, businessError, passwordFormState, emailAccountIssue, passwordFormIssue, passwordResetVisible } = require("./login-request.cjs");
 const { credentialsRejected } = require("./credentials.cjs");
 const { observePersona } = require("./persona.cjs");
 const { enterOfficialLogin, EMAIL_SELECTOR, isBrowsingPaused } = require("./login-navigation.cjs");
@@ -145,8 +146,14 @@ async function main() {
           )
           .first(),
       );
+      observation.passwordResetVisible = await passwordResetVisible(page);
+      if (observation.passwordResetVisible) {
+        result.passwordResetRequired = true;
+        result.accountIssue = "password-reset-required";
+      }
       observation.browsingActivityPaused = await isBrowsingPaused(page);
       const human =
+        observation.passwordResetVisible ||
         observation.browsingActivityPaused ||
         observation.imageChallengeVisible ||
         observation.checkboxChallengeVisible ||
@@ -353,14 +360,9 @@ async function main() {
                     length: typeof token === "string" ? token.length : null,
                   };
                 } catch {}
-                item.businessError = {};
-                for (const key of ["errorType", "message", "responseCode"])
-                  if (key in json)
-                    item.businessError[key] =
-                      typeof json[key] === "string"
-                        ? redact(json[key])
-                        : json[key];
               }
+              if (u.pathname === "/json/sign-in" || u.pathname === "/json/account-status-validation")
+                item.businessError = businessError(json, redact);
             } catch {}
           })(),
         );
@@ -505,19 +507,22 @@ async function main() {
     }
     stage = "email_once";
     checkStopped();
-    const emailResponse = page.waitForResponse(
-      (r) =>
-        new URL(r.url()).pathname === "/json/account-status-validation" &&
-        r.request().method() === "POST",
-      { timeout: 60000 },
-    );
     await page.locator(selector).first().fill(input.email, { timeout: 15000 });
     result.attempts.email++;
-    await page.locator('button[type="submit"]').click({ timeout: 15000 });
-    const email = await emailResponse;
+    const email = await submitAndWaitForResponse(page, "/json/account-status-validation", () =>
+      page.locator('button[type="submit"]').click({ timeout: 15000 }));
     result.emailStatus = email.status();
     await observeUI("after-email");
-    if (email.status() !== 200) throw new Error("Email request not accepted");
+    if (email.status() !== 200) {
+      result.emailBusinessError = businessError(await email.json().catch(() => null), redact);
+      const issue = emailAccountIssue(result.emailBusinessError);
+      if (issue) {
+        result.accountIssue = issue;
+        result.requiresHumanInteraction = true;
+      }
+      const detail = result.emailBusinessError.message || result.emailBusinessError.errorType;
+      throw new Error(`Email request not accepted (HTTP ${email.status()})${detail ? ": " + detail : ""}`);
+    }
     stage = "password_once";
     checkStopped();
     await page
@@ -528,6 +533,7 @@ async function main() {
     await page
       .locator('input[type="password"]')
       .fill(input.password, { timeout: 15000 });
+    result.passwordFormAfterFill = await passwordFormState(page);
     // The password field can become visible before the site's async CAPTCHA
     // runtime has loaded. Observe its public API; let the site's own click
     // handler perform the verification. Never create or inject a token here.
@@ -560,15 +566,16 @@ async function main() {
     await observeUI("recaptcha-ready");
     checkStopped();
     stage = "password_once";
-    const passwordResponse = page.waitForResponse(
-      (r) =>
-        new URL(r.url()).pathname === "/json/sign-in" &&
-        r.request().method() === "POST",
-      { timeout: 60000 },
-    );
+    result.passwordFormBeforeSubmit = await passwordFormState(page);
+    const formIssue = passwordFormIssue(result.passwordFormBeforeSubmit);
+    if (formIssue) {
+      result.accountIssue = formIssue;
+      result.requiresHumanInteraction = true;
+      throw new Error(formIssue === "password-submit-disabled" ? "密码仅7位，登录按钮不可用，请核对密码。" : "密码格式不符合网站要求，请核对密码。");
+    }
     result.attempts.password++;
-    await page.locator('button[type="submit"]').click({ timeout: 15000 });
-    const password = await passwordResponse;
+    const password = await submitAndWaitForResponse(page, "/json/sign-in", () =>
+      page.locator('button[type="submit"]').click({ timeout: 15000 }));
     result.passwordStatus = password.status();
     const passwordBody = await password.json().catch(() => null);
     if (credentialsRejected(passwordBody)) {
@@ -607,19 +614,36 @@ async function main() {
     result.finalHost = current.hostname;
     result.finalPath = current.pathname;
     stage = "readonly_com_fan";
-    // Observe the campaign's own read-only Fan request and its actual Cookie.
-    const fanUntil = Date.now() + 30000;
-    while (Date.now() < fanUntil && result.fanIsLoggedIn !== true) {
+    // Wait for the complete account identity and Cookie, not only isLoggedIn.
+    const waitForVerifiedFan = async () => {
+      const until = Date.now() + 30000;
+      while (Date.now() < until) {
+        checkStopped();
+        if (result.fanIsLoggedIn === true && !result.fanAccountMatches)
+          throw new Error("Fan account did not match the submitted account");
+        if (result.fanIsLoggedIn === true && result.fanAccountMatches && verifiedCookieHeader) break;
+        await wait(500);
+      }
+      await Promise.allSettled(pending);
       checkStopped();
-      await wait(500);
-    }
-    await Promise.allSettled(pending);
-    if (result.fanIsLoggedIn !== true)
-      throw new Error("Authenticated Fan response not observed");
-    if (!result.fanAccountMatches)
-      throw new Error("Fan account did not match the submitted account");
-    if (!verifiedCookieHeader)
-      throw new Error("Authenticated Fan Cookie header was not captured");
+      if (result.fanIsLoggedIn === true && !result.fanAccountMatches)
+        throw new Error("Fan account did not match the submitted account");
+      const current = new URL(page.url());
+      if (current.origin !== startURL.origin || current.pathname !== startURL.pathname)
+        throw new Error("Campaign page changed during account verification");
+      return result.fanIsLoggedIn === true && result.fanAccountMatches && !!verifiedCookieHeader;
+    };
+    Object.assign(result, await ensureAccountPageWithRefresh(page, {
+      checkStopped,
+      verify: waitForVerifiedFan,
+      onRefresh: (count) => {
+        stage = "refresh_account_page";
+        result.accountPageRefreshes = count;
+        result.fanIsLoggedIn = null;
+        result.fanAccountMatches = false;
+        verifiedCookieHeader = null;
+      },
+    }));
     stage = "capture_page";
     Object.assign(result, await capturePageWithRefresh(page, path.join(out, "com-result.png"), checkStopped, {
       onRefresh: (count) => {
@@ -629,18 +653,11 @@ async function main() {
         verifiedCookieHeader = null;
       },
       afterRefresh: async () => {
-        const until = Date.now() + 30000;
-        while (Date.now() < until && result.fanIsLoggedIn !== true) {
-          checkStopped();
-          await wait(500);
+        if (!(await waitForVerifiedFan())) {
+          const error = new Error("Authenticated Fan response not observed after screenshot refresh");
+          error.name = "TimeoutError";
+          throw error;
         }
-        await Promise.allSettled(pending);
-        checkStopped();
-        if (result.fanIsLoggedIn !== true || !result.fanAccountMatches || !verifiedCookieHeader)
-          throw new Error("Authenticated Fan response not verified after screenshot refresh");
-        const current = new URL(page.url());
-        if (current.origin !== startURL.origin || current.pathname !== startURL.pathname)
-          throw new Error("Campaign page changed after screenshot refresh");
       },
     }));
     result.loginCompleted = true;

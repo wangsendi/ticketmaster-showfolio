@@ -5,7 +5,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const { firefox } = require("playwright");
-const { capturePage, capturePageWithRefresh } = require("../src/capture.cjs");
+const { capturePage, capturePageWithRefresh, ensureAccountPageWithRefresh } = require("../src/capture.cjs");
 
 const screenshotTimeout = () => Object.assign(new Error("screenshot timed out"), { name: "TimeoutError" });
 
@@ -75,6 +75,30 @@ test("cancellation and failed account verification stop screenshot refreshes", a
   }), /account verification failed/);
   assert.equal(captures, 2);
   assert.equal(reloads, 1);
+});
+
+test("late account responses can recover through the same session without restarting login", async()=>{
+  let reloads=0, verifies=0;
+  const page={reload:async()=>{reloads++;}};
+  const result=await ensureAccountPageWithRefresh(page,{
+    verify:async()=>++verifies===3,
+    onRefresh:count=>assert.equal(count,reloads+1),
+  });
+  assert.equal(result.accountPageRefreshes,2);
+  assert.equal(reloads,2);
+  assert.equal(verifies,3);
+});
+
+test("account recovery caps refreshes and stops on cancellation or wrong account",async()=>{
+  let reloads=0;
+  const page={reload:async()=>{reloads++;}};
+  await assert.rejects(ensureAccountPageWithRefresh(page,{verify:async()=>false}),/after three refreshes/);
+  assert.equal(reloads,3);
+  reloads=0;
+  await assert.rejects(ensureAccountPageWithRefresh(page,{verify:async()=>{throw new Error("wrong account");}}),/wrong account/);
+  assert.equal(reloads,0);
+  await assert.rejects(ensureAccountPageWithRefresh(page,{verify:async()=>true,checkStopped:()=>{throw new Error("cancelled");}}),/cancelled/);
+  assert.equal(reloads,0);
 });
 
 test("captures the whole page, including content loaded after scrolling", async () => {

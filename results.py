@@ -18,6 +18,39 @@ def credentials_rejected(result):
         for item in result.get("responses", [])))
 
 
+ACCOUNT_ISSUES = {
+    "account-not-found": "账号不存在",
+    "password-reset-required": "需要重置密码",
+    "password-submit-disabled": "密码仅7位，登录按钮不可用，请核对密码",
+    "password-review-required": "密码仅7位，请核对密码",
+    "password-format-invalid": "密码格式不符合网站要求，请核对密码",
+}
+
+
+def account_issue(result):
+    code = result.get("accountIssue")
+    if code in ACCOUNT_ISSUES:
+        return code, ACCOUNT_ISSUES[code]
+    errors = [result.get("emailBusinessError") or {}] + [
+        item.get("businessError") or {} for item in result.get("responses", [])
+        if item.get("path") == "/json/account-status-validation"]
+    for error in errors:
+        message = str(error.get("message", ""))
+        if re.search(r"\b(?:the\s+)?user\s+is\s+not\s+found\b|\baccount\s+(?:does\s+not\s+exist|not\s+found)\b", message, re.I):
+            return "account-not-found", ACCOUNT_ISSUES["account-not-found"]
+        if re.search(r"password\s+reset\s+(?:is\s+)?required|reset\s+your\s+password", message, re.I):
+            return "password-reset-required", ACCOUNT_ISSUES["password-reset-required"]
+    if result.get("passwordResetRequired") or any(item.get("passwordResetVisible") for item in result.get("uiObservations", [])):
+        return "password-reset-required", ACCOUNT_ISSUES["password-reset-required"]
+    form = result.get("passwordFormBeforeSubmit") or {}
+    if form.get("submitEnabled") is False:
+        if form.get("tooShort") or form.get("patternMismatch"):
+            return "password-format-invalid", ACCOUNT_ISSUES["password-format-invalid"]
+        if form.get("valueLength") == 7:
+            return "password-submit-disabled", ACCOUNT_ISSUES["password-submit-disabled"]
+    return None
+
+
 def has_persona_evidence(result):
     observations = [result.get("humanVerificationObservation") or {}, *(result.get("uiObservations") or [])]
     return bool(result.get("personaVerificationRequired") or any(
@@ -139,7 +172,7 @@ def collect(directory, email, summary):
     data = {"result": result, "selections": None, "cookie_header": None, "error": None,
             "status": "cancelled" if summary.get("stopped") else "failed"}
     requirement = verification_requirement(result)
-    if requirement:
+    if requirement and not summary.get("stopped"):
         data["status"] = "needs-human"
         result["verificationRequirement"] = requirement
     if summary.get("authenticated") and not requirement:
@@ -169,6 +202,11 @@ def collect(directory, email, summary):
         result["credentialsRejected"] = True
         result["verificationRequirement"] = "账号密码错误"
         data["error"] = None
+    issue = account_issue(result)
+    if issue and not summary.get("stopped") and not summary.get("authenticated"):
+        result["accountIssue"], result["verificationRequirement"] = issue
+        data["status"] = "success"
+        data["error"] = None
     if data["status"] in ("failed", "needs-human", "cancelled"):
         if requirement and verification_status(result) == "failed":
             message = "网站已暂停访问（Browsing Activity Paused），可更换代理重试。"
@@ -178,6 +216,11 @@ def collect(directory, email, summary):
             errors = [item.get("businessError", {}) for item in result.get("responses", []) if item.get("path") == "/json/sign-in" and item.get("status") == 403]
             detail = errors[-1].get("errorType") or errors[-1].get("message") if errors else None
             message = "网站拒绝密码步骤（HTTP 403）" + (f"：{detail}" if detail else "；返回未说明具体原因。")
+        elif result.get("emailStatus") and result["emailStatus"] != 200 and data["status"] == "failed":
+            errors = [item.get("businessError") or {} for item in result.get("responses", [])
+                      if item.get("path") == "/json/account-status-validation" and item.get("status") == result["emailStatus"]]
+            detail = (errors[-1].get("message") or errors[-1].get("errorType")) if errors else None
+            message = f"网站拒绝邮箱步骤（HTTP {result['emailStatus']}）" + (f"：{detail}" if detail else "；未记录具体业务原因。")
         elif data["status"] == "needs-human":
             message = ("网站已暂停此网络或浏览器的访问（Browsing Activity Paused），需人工处理，已停止自动重试。"
                        if result.get("browsingActivityPaused") else "网站要求人工验证，本次查询已停止。")

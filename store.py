@@ -76,15 +76,20 @@ class Store:
                            (status, "complete" if status == "success" else result.get("failureStage"), status == "success", dumps(result), row["id"]))
 
     def normalize_credentials_results(self):
-        from results import credentials_rejected
+        from results import account_issue, credentials_rejected
         with self.connect(write=True) as db:
             rows = db.execute("SELECT id,result FROM runs WHERE status IN ('failed','partial','needs-human')").fetchall()
             for row in rows:
                 result = json.loads(row["result"] or "{}")
-                if result.get("authenticated") or not credentials_rejected(result):
+                issue = account_issue(result)
+                rejected = credentials_rejected(result)
+                if result.get("authenticated") or not (issue or rejected):
                     continue
-                result["credentialsRejected"] = True
-                result["verificationRequirement"] = "账号密码错误"
+                if issue:
+                    result["accountIssue"], result["verificationRequirement"] = issue
+                else:
+                    result["credentialsRejected"] = True
+                    result["verificationRequirement"] = "账号密码错误"
                 db.execute("UPDATE runs SET status='success',stage='complete',error=NULL,result=? WHERE id=? AND status IN ('failed','partial','needs-human')",
                            (dumps(result), row["id"]))
 

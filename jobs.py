@@ -11,7 +11,7 @@ import time
 
 from proxy_check import fresh_pool, filtered_pool_from_api
 from proxy_pool import DEFAULT_PROXY_API, NoAlternativeProxy, ProxyRefreshError
-from results import collect, credentials_rejected, has_persona_evidence
+from results import account_issue, collect, credentials_rejected, has_persona_evidence
 from runner import browser_command, run_account
 from store import now
 
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 def proxy_outcome(data):
     result = data.get("result", {})
-    if data["status"] == "cancelled" or credentials_rejected(result) or has_persona_evidence(result):
+    if data["status"] == "cancelled" or credentials_rejected(result) or account_issue(result) or has_persona_evidence(result):
         return None
     if result.get("verification", {}).get("authenticated"):
         return True

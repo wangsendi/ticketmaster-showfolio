@@ -57,4 +57,25 @@ async function capturePageWithRefresh(page, filename, checkStopped = () => {}, {
   }
 }
 
-module.exports = { capturePage, capturePageWithRefresh };
+async function ensureAccountPageWithRefresh(page, {
+  verify, onRefresh = () => {}, checkStopped = () => {},
+}) {
+  for (let refreshes = 0; refreshes <= 3; refreshes++) {
+    checkStopped();
+    try {
+      if (refreshes) {
+        await onRefresh(refreshes);
+        await page.reload({waitUntil:"domcontentloaded", timeout:60000});
+        checkStopped();
+      }
+      if (await verify()) return {accountPageRefreshes:refreshes};
+    } catch (error) {
+      checkStopped();
+      if (error.name !== "TimeoutError") throw error;
+      if (refreshes === 3) throw error;
+    }
+  }
+  throw new Error("Authenticated account page not verified after three refreshes");
+}
+
+module.exports = { capturePage, capturePageWithRefresh, ensureAccountPageWithRefresh };
