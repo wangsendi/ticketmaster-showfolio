@@ -26,7 +26,7 @@ def selected_browser():
             if not isinstance(name, str):
                 raise ValueError()
         except FileNotFoundError:
-            name = os.environ.get("TM_BROWSER", "cloakbrowser")
+            name = os.environ.get("TM_BROWSER", "firefox")
         except (ValueError, KeyError, TypeError):
             raise ValueError("浏览器配置文件无效，请检查 data/browser.json。") from None
     name = name.strip().lower()

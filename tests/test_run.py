@@ -41,9 +41,9 @@ class RunnerStopTests(unittest.TestCase):
             self.assertEqual(result["browser"], "firefox")
         self.assertEqual(selected_browser(), "cloakbrowser")
 
-    def test_default_is_cloakbrowser_without_runtime_setting(self):
+    def test_default_is_firefox_without_runtime_setting(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(selected_browser(), "cloakbrowser")
+            self.assertEqual(selected_browser(), "firefox")
 
     def test_chromium_selection_reaches_child_and_saved_context(self):
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"TM_BROWSER":"chromium"}):

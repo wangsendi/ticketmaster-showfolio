@@ -5,7 +5,7 @@ const { chromium, firefox } = require('playwright');
 const CLOAK_VERSION = '146.0.7680.177.5';
 const DEFAULT_LOCALE = 'zh-CN';
 
-function configuredBrowser(fallback = process.env.TM_BROWSER || 'cloakbrowser', configPath = process.env.TM_BROWSER_CONFIG || path.join(__dirname, '../data/browser.json')) {
+function configuredBrowser(fallback = process.env.TM_BROWSER || 'firefox', configPath = process.env.TM_BROWSER_CONFIG || path.join(__dirname, '../data/browser.json')) {
   if (process.env.TM_BROWSER_OVERRIDE !== undefined) {
     return browserConfig(process.env.TM_BROWSER_OVERRIDE).name;
   }
@@ -42,7 +42,7 @@ async function launchCloak(options) {
     browserVersion:CLOAK_VERSION, launchOptions:{timeout:options.timeout || 30000}});
 }
 
-function browserConfig(value = 'cloakbrowser') {
+function browserConfig(value = 'firefox') {
   const name = String(value).trim().toLowerCase();
   if (name === 'cloakbrowser') return {name, type:{launch:launchCloak, executablePath:cloakBinaryPath}, launchOptions:{}};
   if (name === 'firefox') return { name, type: firefox, launchOptions: {} };

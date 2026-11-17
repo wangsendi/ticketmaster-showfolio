@@ -9,13 +9,13 @@
 ```bash
 python3 -m pip install -r requirements.txt
 npm ci
-npm run install:cloakbrowser
+npm run install:firefox
 python3 web.py --host 127.0.0.1 --port 8088
 ```
 
 打开 <http://127.0.0.1:8088>。`npm start` 和 `python3 run.py` 也可启动服务。
 
-默认使用 CloakBrowser 0.6.5，浏览器固定为 Chromium 146.0.7680.177.5，关闭自动更新。该旧版无需许可证，安装脚本下载到 `data/browser-cache`；仓库不包含浏览器二进制文件。
+默认使用 Playwright Firefox，无需额外传入浏览器参数。也可选择 Chromium、Google Chrome 或 CloakBrowser；CloakBrowser 需先执行 `npm run install:cloakbrowser`，使用固定的 Chromium 146.0.7680.177.5 并关闭自动更新，安装至 `data/browser-cache`。仓库不包含浏览器二进制文件。
 
 账号详情和导出文件会显示完整密码及 Cookie。默认仅监听本机；需要从局域网访问时，可自行指定 `--host 0.0.0.0`。
 
@@ -91,7 +91,7 @@ mkdir -p data
 cp config/browser.example.json data/browser.json
 ```
 
-没有运行时设置文件时，使用 `TM_BROWSER`；未设置时默认 CloakBrowser。可选浏览器安装命令：`npm run install:chromium`、`npm run install:firefox`。Google Chrome 需要单独安装。缺失依赖会明确报错，不自动回退。
+没有运行时设置文件时，使用 `TM_BROWSER`；未设置时默认 Firefox。可选浏览器安装命令：`npm run install:chromium`、`npm run install:firefox`。Google Chrome 需要单独安装。缺失依赖会明确报错，不自动回退。
 
 ## 本地数据与隐私
 

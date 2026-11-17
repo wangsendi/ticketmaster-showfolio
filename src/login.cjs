@@ -201,7 +201,7 @@ async function main() {
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const pending = [];
   try {
-    const selected = assertBrowserInstalled(configuredBrowser(input.browser || "cloakbrowser"));
+    const selected = assertBrowserInstalled(configuredBrowser(input.browser || "firefox"));
     result.browser = selected.name;
     const launchOptions = { ...selected.launchOptions, headless: false, timeout: 30000 };
     if (selected.name === "cloakbrowser") {
