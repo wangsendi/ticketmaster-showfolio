@@ -55,6 +55,7 @@ class Store:
             db.execute("UPDATE proxy_reputations SET confidence=0,disabled_until=-1 WHERE confidence=0 OR disabled_until<>0")
         self.path.chmod(0o600)
         self.normalize_verification_results()
+        self.normalize_credentials_results()
 
     def normalize_verification_results(self):
         from results import verification_requirement, verification_status
@@ -73,6 +74,19 @@ class Store:
                 status = verification_status(result)
                 db.execute("UPDATE runs SET status=?,stage=?,error=CASE WHEN ? THEN NULL ELSE error END,result=? WHERE id=? AND status IN ('needs-human','success')",
                            (status, "complete" if status == "success" else result.get("failureStage"), status == "success", dumps(result), row["id"]))
+
+    def normalize_credentials_results(self):
+        from results import credentials_rejected
+        with self.connect(write=True) as db:
+            rows = db.execute("SELECT id,result FROM runs WHERE status IN ('failed','partial','needs-human')").fetchall()
+            for row in rows:
+                result = json.loads(row["result"] or "{}")
+                if result.get("authenticated") or not credentials_rejected(result):
+                    continue
+                result["credentialsRejected"] = True
+                result["verificationRequirement"] = "账号密码错误"
+                db.execute("UPDATE runs SET status='success',stage='complete',error=NULL,result=? WHERE id=? AND status IN ('failed','partial','needs-human')",
+                           (dumps(result), row["id"]))
 
     def proxy_reputations(self):
         with self.connect() as db:

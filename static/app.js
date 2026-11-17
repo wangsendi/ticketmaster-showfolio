@@ -5,7 +5,7 @@ const failedStatuses = new Set(["failed", "partial", "interrupted"]);
 const token = document.querySelector('meta[name="app-token"]').content;
 const state = { batches: [], batch: null, runs: [], filter: "all", page: 1, detail: null, refreshing: false, proxies: null, exports: {} };
 const statusNames = { draft: "待开始", pending: "等待查询", running: "查询中", success: "已完成", partial: "结果不完整", failed: "查询失败", "needs-human": "需人工验证", cancelled: "已停止", interrupted: "已中断", complete: "已结束" };
-const stageNames = { refresh_proxies: "更新代理名单", wait_proxy: "等待空闲出口 IP", retry_queued: "等待重试", retry_wait: "等待更换代理重试", setup: "准备代理", service: "查询服务异常", launch: "启动浏览器", proxy_setup: "连接代理", campaign: "打开活动", official_sign_in: "打开登录", wait_email: "等待邮箱页面", wait_recaptcha_before_email: "等待验证加载", email_once: "提交邮箱", password_once: "提交密码", wait_recaptcha_initialization: "等待验证加载", wait_exchange: "等待登录回调", wait_com_return: "返回活动页面", readonly_com_fan: "读取报名记录", capture_page: "生成整页截图", browser_driver: "浏览器驱动崩溃", browser_process: "浏览器进程异常", complete: "查询结束", runner: "查询进程异常", timeout: "查询超时" };
+const stageNames = { refresh_proxies: "更新代理名单", wait_proxy: "等待空闲出口 IP", wait_start: "等待启动浏览器", retry_queued: "等待重试", retry_wait: "等待更换代理重试", setup: "准备代理", service: "查询服务异常", launch: "启动浏览器", proxy_setup: "连接代理", campaign: "打开活动", official_sign_in: "打开登录", wait_email: "等待邮箱页面", wait_recaptcha_before_email: "等待验证加载", email_once: "提交邮箱", password_once: "提交密码", wait_recaptcha_initialization: "等待验证加载", wait_exchange: "等待登录回调", wait_com_return: "返回活动页面", readonly_com_fan: "读取报名记录", capture_page: "生成整页截图", browser_driver: "浏览器驱动崩溃", browser_process: "浏览器进程异常", complete: "查询结束", runner: "查询进程异常", timeout: "查询超时" };
 const esc = value => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 const date = value => value ? new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }) : "—";
 const badge = status => `<span class="badge ${esc(status)}">${esc(statusNames[status] || status)}</span>`;
@@ -198,7 +198,7 @@ async function openDetail(id) {
   renderDetailActions();
   $("download-shot").hidden = !data.has_screenshot;
   $("download-shot").href = `/api/runs/${id}/screenshot?download=1`;
-  $("screenshot-kind").textContent = !data.has_screenshot ? "" : result.verificationRequirement ? "验证要求页面" : data.screenshot_kind === "full-page" ? `整页长截图${result.screenshotHeight ? ` · ${result.screenshotWidth} × ${result.screenshotHeight}` : ""}` : data.screenshot_kind === "legacy-viewport" ? "历史截图 · 仅包含当时第一屏" : "失败时页面";
+  $("screenshot-kind").textContent = !data.has_screenshot ? "" : result.credentialsRejected ? "账号密码错误页面" : result.verificationRequirement ? "验证要求页面" : data.screenshot_kind === "full-page" ? `整页长截图${result.screenshotHeight ? ` · ${result.screenshotWidth} × ${result.screenshotHeight}` : ""}` : data.screenshot_kind === "legacy-viewport" ? "历史截图 · 仅包含当时第一屏" : "失败时页面";
   $("screenshot-content").innerHTML = data.has_screenshot ? `<a href="/api/runs/${id}/screenshot" target="_blank" rel="noopener" aria-label="打开原始页面截图"><img src="/api/runs/${id}/screenshot" alt="${esc(data.email)} 的查询页面截图"></a>` : '<div class="empty-state"><h3>暂无页面截图</h3><p>完成查询后，整页截图会出现在这里。</p></div>';
   if (!$("detail-dialog").open) $("detail-dialog").showModal();
 }

@@ -11,7 +11,7 @@ import time
 
 from proxy_check import fresh_pool, filtered_pool_from_api
 from proxy_pool import DEFAULT_PROXY_API, NoAlternativeProxy, ProxyRefreshError
-from results import collect, has_persona_evidence
+from results import collect, credentials_rejected, has_persona_evidence
 from runner import browser_command, run_account
 from store import now
 
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 def proxy_outcome(data):
     result = data.get("result", {})
-    if data["status"] == "cancelled" or has_persona_evidence(result):
+    if data["status"] == "cancelled" or credentials_rejected(result) or has_persona_evidence(result):
         return None
     if result.get("verification", {}).get("authenticated"):
         return True
@@ -318,6 +318,7 @@ class QueryService:
                         else:
                             self.store.progress(run_id, {"stage":"wait_proxy"})
                         with pool.lease(previous=previous, stop_event=event, wait=True) as proxy:
+                            self.store.progress(run_id, {"stage":"wait_start"})
                             with gate:
                                 if event.wait(max(0, next_start[0] - time.monotonic())):
                                     raise InterruptedError("查询已取消。")

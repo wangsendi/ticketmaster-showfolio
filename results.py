@@ -10,6 +10,14 @@ from datetime import datetime
 from verify import audit, response_json
 
 
+def credentials_rejected(result):
+    return bool(result.get("credentialsRejected") or any(
+        item.get("path") == "/json/sign-in" and re.search(
+            r"\bcredentials?\s+mismatch\b|\binvalid\s+credentials\b|\bincorrect\s+(?:email\s+(?:or|and)\s+)?password\b|账号或密码错误|邮箱或密码错误|密码不正确",
+            str((item.get("businessError") or {}).get("message", "")), re.I)
+        for item in result.get("responses", [])))
+
+
 def has_persona_evidence(result):
     observations = [result.get("humanVerificationObservation") or {}, *(result.get("uiObservations") or [])]
     return bool(result.get("personaVerificationRequired") or any(
@@ -155,6 +163,11 @@ def collect(directory, email, summary):
                 result["selectionWarning"] = "已登录但场次解析失败。"
     if requirement and not summary.get("stopped"):
         data["status"] = verification_status(result)
+        data["error"] = None
+    if not summary.get("stopped") and not summary.get("authenticated") and credentials_rejected(result):
+        data["status"] = "success"
+        result["credentialsRejected"] = True
+        result["verificationRequirement"] = "账号密码错误"
         data["error"] = None
     if data["status"] in ("failed", "needs-human", "cancelled"):
         if requirement and verification_status(result) == "failed":

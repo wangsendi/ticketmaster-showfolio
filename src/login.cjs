@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { assertBrowserInstalled, configuredBrowser, createBrowserContext, DEFAULT_LOCALE } = require("./browser.cjs");
 const { capturePageWithRefresh } = require("./capture.cjs");
+const { credentialsRejected } = require("./credentials.cjs");
 const { observePersona } = require("./persona.cjs");
 const { enterOfficialLogin, EMAIL_SELECTOR, isBrowsingPaused } = require("./login-navigation.cjs");
 const { createBridge } = require("./proxy-bridge.cjs");
@@ -569,6 +570,11 @@ async function main() {
     await page.locator('button[type="submit"]').click({ timeout: 15000 });
     const password = await passwordResponse;
     result.passwordStatus = password.status();
+    const passwordBody = await password.json().catch(() => null);
+    if (credentialsRejected(passwordBody)) {
+      result.credentialsRejected = true;
+      throw new Error("账号或密码错误，网站提示登录凭据不匹配。");
+    }
     await observeUI("after-password");
     if (password.status() !== 200)
       throw new Error("Password request not accepted");
