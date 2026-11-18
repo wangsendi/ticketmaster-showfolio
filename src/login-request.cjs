@@ -10,6 +10,39 @@ async function submitAndWaitForResponse(page, pathname, submit) {
   return received;
 }
 
+async function waitForSubmitReady(page, { timeout = 60000, diagnostics = {}, checkStopped = () => {} } = {}) {
+  const button = page.locator('button[type="submit"]');
+  const started = performance.now();
+  diagnostics.timeoutMs = timeout;
+  diagnostics.ready = false;
+  const surface = () => button.evaluate(element => {
+    const box = element.getBoundingClientRect();
+    const top = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+    // Describe the obstruction without storing form values or page text.
+    return { covered: !!top && top !== element && !element.contains(top),
+      tag: top?.tagName || null, classes: typeof top?.className === 'string' ? top.className.slice(0, 300) : null,
+      role: top?.getAttribute('role') || null, ariaBusy: top?.getAttribute('aria-busy') || null };
+  }, undefined, { timeout: 3000 }).catch(() => null);
+  try {
+    checkStopped();
+    diagnostics.before = await surface();
+    // Trial performs Playwright's normal visibility, stability and hit testing
+    // without clicking or submitting. Start the response waiter only afterward.
+    await button.click({ trial: true, timeout });
+    checkStopped();
+    diagnostics.ready = true;
+  } catch (error) {
+    diagnostics.errorType = error.name || 'Error';
+    try {
+      checkStopped();
+      diagnostics.after = await surface();
+    } catch {}
+    throw error;
+  } finally {
+    diagnostics.elapsedMs = Math.round(performance.now() - started);
+  }
+}
+
 function businessError(body, redact = value => value) {
   const result = {};
   if (!body || typeof body !== 'object') return result;
@@ -49,4 +82,4 @@ async function passwordResetVisible(page) {
   return page.getByText(/Set up a new password and get back/i).first().isVisible().catch(()=>false);
 }
 
-module.exports = {submitAndWaitForResponse, businessError, passwordFormState, emailAccountIssue, passwordFormIssue, passwordResetVisible};
+module.exports = {submitAndWaitForResponse, waitForSubmitReady, businessError, passwordFormState, emailAccountIssue, passwordFormIssue, passwordResetVisible};

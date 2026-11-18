@@ -107,6 +107,25 @@ class RunnerStopTests(unittest.TestCase):
             self.assertEqual(result["emailStatus"], 200)
             self.assertFalse(result.get("stopped"))
 
+    def test_progress_ignores_timestamp_changes_but_keeps_login_status_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            script = "\n".join([
+                "import json,pathlib,sys,time",
+                "data=json.load(sys.stdin)",
+                "root=pathlib.Path(data['outputDirectory'])",
+                "for index in range(34):",
+                "    status=200 if index >= 15 else None",
+                "    progress={'stage':'password','emailStatus':status,'atUTC':str(index)}",
+                "    (root/'pending.json').write_text(json.dumps(progress))",
+                "    (root/'pending.json').replace(root/'progress.json')",
+                "    time.sleep(0.1)",
+                "print(json.dumps({'authenticated':False}))",
+            ])
+            updates = []
+            run_account("sample@example.invalid", "sample-password", Path(temporary) / "attempt",
+                        [sys.executable, "-c", script], False, DEFAULT_URL, on_progress=updates.append)
+            self.assertEqual([item["emailStatus"] for item in updates], [None, 200])
+
     def test_websocket_driver_crash_preserves_progress_without_claiming_success(self):
         with tempfile.TemporaryDirectory() as temporary:
             out = Path(temporary) / "attempt"

@@ -25,10 +25,14 @@ def contains_account(value, email):
     return False
 
 
-def audit(run_directory, cookie_file=None, expected_email=None):
+def load_har(run_directory):
+    raw = (Path(run_directory) / "com-login.har").read_bytes()
+    return json.loads(raw)["log"]["entries"], hashlib.sha256(raw).hexdigest()
+
+
+def audit(run_directory, cookie_file=None, expected_email=None, *, har=None):
     directory = Path(run_directory)
-    har_path = directory / "com-login.har"
-    entries = json.loads(har_path.read_text(encoding="utf-8"))["log"]["entries"]
+    entries, har_hash = load_har(directory) if har is None else har
     email_posts, password_posts, exchanges, fans = [], [], [], []
     ca_requests = 0
     for index, entry in enumerate(entries):
@@ -76,7 +80,7 @@ def audit(run_directory, cookie_file=None, expected_email=None):
         raise ValueError("Cookie 文件与实际成功 Fan 请求不完全一致。")
     return {"verifiedAtUTC": datetime.now(timezone.utc).isoformat(), "authenticated": True,
             "scope": "https://signup.ticketmaster.com/", "harEntries": len(entries),
-            "harSHA256": hashlib.sha256(har_path.read_bytes()).hexdigest(),
+            "harSHA256": har_hash,
             "emailPostCount": 1, "passwordPostCount": 1, "emailStatus": 200, "passwordStatus": 200,
             "emailHARIndex": email_posts[0][0], "passwordHARIndex": password_posts[0][0],
             "nonemptyRecaptchaToken": True, "exchangeHARIndices": exchanges, "fanHARIndex": index,

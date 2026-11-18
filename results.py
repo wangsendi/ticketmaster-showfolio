@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 from datetime import datetime
 
-from verify import audit, response_json
+from verify import audit, load_har, response_json
 
 
 def credentials_rejected(result):
@@ -84,8 +84,9 @@ def verification_status(result):
     return "needs-human"
 
 
-def selections_from_har(directory, email):
-    entries = json.loads((Path(directory) / "com-login.har").read_text())["log"]["entries"]
+def selections_from_har(directory, email, *, entries=None):
+    if entries is None:
+        entries, _ = load_har(directory)
     markets, records = {}, []
 
     def walk(value):
@@ -177,7 +178,8 @@ def collect(directory, email, summary):
         result["verificationRequirement"] = requirement
     if summary.get("authenticated") and not requirement:
         try:
-            result["verification"] = audit(directory, expected_email=email)
+            har = load_har(directory)
+            result["verification"] = audit(directory, expected_email=email, har=har)
             data["cookie_header"] = (directory / "cookie-header.txt").read_text().rstrip("\r\n")
         except (OSError, ValueError, KeyError, TypeError):
             data["error"] = "登录结果核对未通过。"
@@ -189,7 +191,7 @@ def collect(directory, email, summary):
                 data["status"] = "partial"
                 data["error"] = "已登录，但整页截图未生成。"
             try:
-                data["selections"], result["entryRecord"] = selections_from_har(directory, email)
+                data["selections"], result["entryRecord"] = selections_from_har(directory, email, entries=har[0])
                 if any(not item["resolved"] for item in data["selections"]):
                     result["selectionWarning"] = "已读取场次 ID，部分日期和场馆未解析。"
             except (OSError, ValueError, KeyError, TypeError, AttributeError):

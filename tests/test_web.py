@@ -1381,6 +1381,28 @@ class JobTests(unittest.TestCase):
         self.assertEqual(json.loads(record["result"])["attempts"], 1)
 
     @patch("jobs.browser_command", return_value=(["node"], False))
+    def test_passkey_click_details_survive_queue_attempt_statistics(self, _):
+        batch_id = self.store.create_batch(self.accounts[:1], "passkey", DEFAULT_URL)
+        def execute(email, password, out, *args, **kwargs):
+            out.mkdir(parents=True)
+            result = {"authenticated": False, "optionalPasskey": True, "failureStage": "wait_exchange",
+                      "attempts": {"email": 1, "password": 1, "optionalPasskey": 2},
+                      "passkeyDismissal": {"attempts": [{"clicked": True}, {"clicked": True}], "completed": False},
+                      "errorType": "PasskeyCallbackTimeout", "errorMessage": "已点击暂不添加 Passkey，但登录回调未完成。"}
+            (out / "result.json").write_text(json.dumps(result))
+            return result
+        service = self.service(self.store, execute=execute, pool_factory=fixture_pool, delay=0)
+        service.start(batch_id); self.wait(service)
+        record = self.store.run(self.store.runs(batch_id)[0]["id"])
+        result = json.loads(record["result"])
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(result["loginAttempts"]["optionalPasskey"], 2)
+        self.assertEqual(len(result["passkeyDismissal"]["attempts"]), 2)
+        self.assertFalse(result["passkeyDismissal"]["completed"])
+        self.assertIn("暂不添加 Passkey", record["error"])
+
+    @patch("jobs.browser_command", return_value=(["node"], False))
     def test_runner_exception_finishes_after_one_attempt(self, _):
         calls = []
         def execute(email, password, out, *args, proxy=None, **kwargs):

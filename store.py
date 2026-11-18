@@ -39,6 +39,7 @@ class Store:
                     UNIQUE(batch_id, email COLLATE NOCASE)
                 );
                 CREATE INDEX IF NOT EXISTS runs_batch ON runs(batch_id, id);
+                CREATE INDEX IF NOT EXISTS runs_batch_status ON runs(batch_id, status);
                 CREATE TABLE IF NOT EXISTS proxy_reputations (
                     route_key TEXT PRIMARY KEY,
                     confidence INTEGER NOT NULL,
@@ -52,6 +53,30 @@ class Store:
                 db.execute("ALTER TABLE batches ADD COLUMN continuous_retry INTEGER NOT NULL DEFAULT 0")
             if "attempt_count" not in {row["name"] for row in db.execute("PRAGMA table_info(runs)")}:
                 db.execute("ALTER TABLE runs ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
+            # Keep the list projection separate from large result JSON and screenshots.
+            # Triggers cover retries, normalization and all other result updates.
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_requirements'").fetchone():
+                db.execute("""CREATE TABLE run_requirements (
+                    run_id INTEGER PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+                    requirement TEXT NOT NULL
+                )""")
+                db.execute("""INSERT INTO run_requirements
+                    SELECT id,json_extract(result,'$.verificationRequirement') FROM runs
+                    WHERE json_extract(result,'$.verificationRequirement') IS NOT NULL""")
+            db.executescript("""
+                CREATE TRIGGER IF NOT EXISTS runs_requirement_insert AFTER INSERT ON runs
+                WHEN json_extract(NEW.result,'$.verificationRequirement') IS NOT NULL
+                BEGIN
+                    INSERT INTO run_requirements VALUES(NEW.id,json_extract(NEW.result,'$.verificationRequirement'));
+                END;
+                CREATE TRIGGER IF NOT EXISTS runs_requirement_update AFTER UPDATE OF result ON runs
+                BEGIN
+                    DELETE FROM run_requirements WHERE run_id=NEW.id;
+                    INSERT INTO run_requirements
+                        SELECT NEW.id,json_extract(NEW.result,'$.verificationRequirement')
+                        WHERE json_extract(NEW.result,'$.verificationRequirement') IS NOT NULL;
+                END;
+            """)
             db.execute("UPDATE proxy_reputations SET confidence=0,disabled_until=-1 WHERE confidence=0 OR disabled_until<>0")
         self.path.chmod(0o600)
         self.normalize_verification_results()
@@ -154,12 +179,13 @@ class Store:
 
     def runs(self, batch_id, include_credentials=False):
         self.batch(batch_id)
-        credentials = ",password,cookie_header" if include_credentials else ""
+        credentials = ",r.password,r.cookie_header" if include_credentials else ""
         with self.connect() as db:
-            rows = db.execute(f"""SELECT id,batch_id,source_line,email,status,stage,started_at,finished_at,selections,error,attempt_count,
-                screenshot IS NOT NULL has_screenshot, cookie_header IS NOT NULL has_cookie,
-                json_extract(result, '$.verificationRequirement') AS verification_requirement{credentials}
-                FROM runs WHERE batch_id=? ORDER BY id""", (batch_id,)).fetchall()
+            rows = db.execute(f"""SELECT r.id,r.batch_id,r.source_line,r.email,r.status,r.stage,r.started_at,r.finished_at,r.selections,r.error,r.attempt_count,
+                r.screenshot IS NOT NULL has_screenshot, r.cookie_header IS NOT NULL has_cookie,
+                q.requirement AS verification_requirement{credentials}
+                FROM runs r LEFT JOIN run_requirements q ON q.run_id=r.id
+                WHERE r.batch_id=? ORDER BY r.id""", (batch_id,)).fetchall()
         return [{**dict(row), "selections": json.loads(row["selections"]) if row["selections"] else None} for row in rows]
 
     def run(self, run_id):
@@ -190,12 +216,15 @@ class Store:
 
     def finish_run(self, run_id, data):
         result = data.get("result", {})
+        # Serialization needs no database lock; other completed accounts can save meanwhile.
+        values = (data["status"], "complete" if data["status"] == "success" else result.get("failureStage") or "complete",
+                  now(), dumps(result), dumps(data.get("selections")), data.get("cookie_header"),
+                  dumps(data.get("cookies")), dumps(data.get("storage_state")), data.get("screenshot"),
+                  data.get("screenshot_kind"), data.get("diagnostic_log"), data.get("error"), run_id)
         with self.connect(write=True) as db:
             db.execute("""UPDATE runs SET status=?,stage=?,finished_at=?,result=?,selections=?,cookie_header=?,
                 cookies=?,storage_state=?,screenshot=?,screenshot_kind=?,diagnostic_log=?,error=? WHERE id=?""",
-                (data["status"], "complete" if data["status"] == "success" else result.get("failureStage") or "complete", now(), dumps(result), dumps(data.get("selections")),
-                 data.get("cookie_header"), dumps(data.get("cookies")), dumps(data.get("storage_state")), data.get("screenshot"),
-                 data.get("screenshot_kind"), data.get("diagnostic_log"), data.get("error"), run_id))
+                values)
 
     def finish_batch(self, batch_id, status="complete", error=None):
         with self.connect(write=True) as db:

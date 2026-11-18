@@ -1,9 +1,12 @@
 "use strict";
 const fs = require("node:fs");
 const path = require("node:path");
+const { loginHarFilter } = require("./har.cjs");
+const { readSession } = require("./session-export.cjs");
+const { dismissOptionalPasskey } = require("./passkey.cjs");
 const { assertBrowserInstalled, configuredBrowser, createBrowserContext, DEFAULT_LOCALE } = require("./browser.cjs");
-const { capturePageWithRefresh, ensureAccountPageWithRefresh } = require("./capture.cjs");
-const { submitAndWaitForResponse, businessError, passwordFormState, emailAccountIssue, passwordFormIssue, passwordResetVisible } = require("./login-request.cjs");
+const { capturePageWithRefresh, ensureAccountPageWithRefresh, captureFailurePage } = require("./capture.cjs");
+const { submitAndWaitForResponse, waitForSubmitReady, businessError, passwordFormState, emailAccountIssue, passwordFormIssue, passwordResetVisible } = require("./login-request.cjs");
 const { credentialsRejected } = require("./credentials.cjs");
 const { observePersona } = require("./persona.cjs");
 const { enterOfficialLogin, EMAIL_SELECTOR, isBrowsingPaused } = require("./login-navigation.cjs");
@@ -59,6 +62,7 @@ async function main() {
     captchaResources: [],
     pageErrorCount: 0,
     pageLifecycle: [],
+    phaseDurationsMs: {},
   };
   let browser, context, page, proxyBridge;
   let verifiedCookieHeader = null;
@@ -244,6 +248,7 @@ async function main() {
         path: path.join(out, "com-login.har"),
         content: "embed",
         mode: "full",
+        urlFilter: loginHarFilter(startURL.href),
       },
     });
     context.on("request", (request) => {
@@ -508,9 +513,13 @@ async function main() {
     stage = "email_once";
     checkStopped();
     await page.locator(selector).first().fill(input.email, { timeout: 15000 });
+    stage = "wait_email_submit";
+    result.emailSubmitReadiness = {};
+    await waitForSubmitReady(page, { diagnostics: result.emailSubmitReadiness, checkStopped });
+    stage = "email_once";
     result.attempts.email++;
     const email = await submitAndWaitForResponse(page, "/json/account-status-validation", () =>
-      page.locator('button[type="submit"]').click({ timeout: 15000 }));
+      page.locator('button[type="submit"]').click({ timeout: 15000, noWaitAfter: true }));
     result.emailStatus = email.status();
     await observeUI("after-email");
     if (email.status() !== 200) {
@@ -573,11 +582,16 @@ async function main() {
       result.requiresHumanInteraction = true;
       throw new Error(formIssue === "password-submit-disabled" ? "密码仅7位，登录按钮不可用，请核对密码。" : "密码格式不符合网站要求，请核对密码。");
     }
+    stage = "wait_password_submit";
+    result.passwordSubmitReadiness = {};
+    await waitForSubmitReady(page, { diagnostics: result.passwordSubmitReadiness, checkStopped });
+    stage = "password_once";
     result.attempts.password++;
     const password = await submitAndWaitForResponse(page, "/json/sign-in", () =>
-      page.locator('button[type="submit"]').click({ timeout: 15000 }));
+      page.locator('button[type="submit"]').click({ timeout: 15000, noWaitAfter: true }));
     result.passwordStatus = password.status();
     const passwordBody = await password.json().catch(() => null);
+    if (passwordBody?.flow === "add-passkey") result.optionalPasskey = true;
     if (credentialsRejected(passwordBody)) {
       result.credentialsRejected = true;
       throw new Error("账号或密码错误，网站提示登录凭据不匹配。");
@@ -586,30 +600,36 @@ async function main() {
     if (password.status() !== 200)
       throw new Error("Password request not accepted");
     stage = "wait_exchange";
+    result.passkeyDismissal = {attempts: [], completed: false};
     const until = Date.now() + 60000;
     while (Date.now() < until && !result.exchangeCOMObserved) {
       checkStopped();
       if (result.verificationRequired) break;
-      if (result.optionalPasskey && result.attempts.optionalPasskey === 0) {
-        const button = page.getByRole("button", {
-          name: "Not Right Now",
-          exact: true,
+      if (result.optionalPasskey) {
+        await dismissOptionalPasskey(page, result.passkeyDismissal, {
+          checkStopped,
+          onAttempt: () => { stage = "dismiss_passkey"; result.attempts.optionalPasskey++; },
         });
-        if (await button.isVisible().catch(() => false)) {
-          result.attempts.optionalPasskey++;
-          await button.click({ timeout: 15000 });
-        }
+        stage = "wait_exchange";
       }
       await wait(500);
     }
-    if (!result.exchangeCOMObserved)
+    result.passkeyDismissal.completed = result.exchangeCOMObserved;
+    if (!result.exchangeCOMObserved) {
+      if (result.optionalPasskey) {
+        const error = new Error(result.passkeyDismissal.attempts.some(item => item.clicked)
+          ? "已点击暂不添加 Passkey，但登录回调未完成。"
+          : "添加 Passkey 页面未就绪，未能点击暂不添加，登录回调未完成。");
+        error.name = "PasskeyCallbackTimeout";
+        throw error;
+      }
       throw new Error("COM exchange not observed");
+    }
     stage = "wait_com_return";
-    await page.waitForURL((url) => url.hostname === expectedHost, {
+    await page.waitForURL((url) => url.origin === startURL.origin && url.pathname === startURL.pathname, {
       waitUntil: "domcontentloaded",
       timeout: 45000,
     });
-    await page.waitForTimeout(3000);
     const current = new URL(page.url());
     result.finalHost = current.hostname;
     result.finalPath = current.pathname;
@@ -665,21 +685,17 @@ async function main() {
     result.failureStage = stage;
     result.errorType = error.name || "Error";
     result.errorMessage = redact(error.message);
-    if (page)
-      await page
-        .screenshot({ path: path.join(out, "failure.png"), fullPage: true, timeout: 5000 })
-        .catch(() => {});
+    if (page) Object.assign(result, await captureFailurePage(page, path.join(out, "failure.png"), { isStopped: stopped, redactError: redact }));
   } finally {
     cleanupStarted = true;
     clearInterval(observer);
     await observeUI("final-page");
     await Promise.allSettled(pending);
     if (context) {
+      stage = "export_session";
+      const exportStarted = performance.now();
       try {
-        const all = await context.cookies();
-        const signup = await context.cookies(
-          "https://signup.ticketmaster.com/",
-        );
+        const { signup, storageState, caCookieCount } = await readSession(context);
         fs.writeFileSync(
           path.join(out, "cookies.json"),
           JSON.stringify(signup, null, 2) + "\n",
@@ -687,19 +703,17 @@ async function main() {
         );
         fs.writeFileSync(
           path.join(out, "storage-state.json"),
-          JSON.stringify(await context.storageState(), null, 2) + "\n",
+          JSON.stringify(storageState, null, 2) + "\n",
           { mode: 0o600 },
         );
         result.cookieCount = signup.length;
         result.signupCookieNames = signup.map((c) => c.name).sort();
         result.signupHasIDToken = signup.some((c) => c.name === "id-token");
-        result.caCookieCount = all.filter(
-          (c) =>
-            c.domain === "ticketmaster.ca" ||
-            c.domain.endsWith(".ticketmaster.ca"),
-        ).length;
+        result.caCookieCount = caCookieCount;
       } catch (error) {
         result.cookieExportErrorType = error.name || "Error";
+      } finally {
+        result.phaseDurationsMs.sessionExport = Math.round(performance.now() - exportStarted);
       }
       result.authenticated =
         result.exchangeCOMObserved &&
@@ -715,15 +729,22 @@ async function main() {
         result.cookieHeaderSource =
           "Exact Cookie header of the authenticated Fan request";
       }
+      stage = "close_context";
+      const closeStarted = performance.now();
       await context.close().catch(() => {});
+      result.phaseDurationsMs.contextClose = Math.round(performance.now() - closeStarted);
     }
     result.authenticated = !!result.authenticated;
+    stage = "close_browser";
+    const browserCloseStarted = performance.now();
     if (browser) await browser.close().catch(() => {});
     if (proxyBridge) {
       await proxyBridge.shutdown();
       result.proxyStats = proxyBridge.stats;
     }
+    result.phaseDurationsMs.browserClose = Math.round(performance.now() - browserCloseStarted);
     clearInterval(progress);
+    result.loginAttempts = { ...result.attempts };
     result.finishedAtUTC = new Date().toISOString();
     fs.writeFileSync(
       path.join(out, "result.json"),

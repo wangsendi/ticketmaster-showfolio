@@ -134,7 +134,7 @@ def run_account(email, password, out, command, use_xvfb, url, metadata=None, sto
     with (out / "login.reserved").open("x", encoding="utf-8") as handle:
         handle.write("one browser account attempt\n")
     source_hashes = {}
-    for name in ("runner.py", "jobs.py", "results.py", "proxy_pool.py", "src/login.cjs", "src/browser.cjs", "src/login-navigation.cjs", "src/proxy-bridge.cjs", "src/persona.cjs", "verify.py"):
+    for name in ("runner.py", "jobs.py", "results.py", "proxy_pool.py", "src/login.cjs", "src/har.cjs", "src/capture.cjs", "src/session-export.cjs", "src/login-request.cjs", "src/passkey.cjs", "src/browser.cjs", "src/login-navigation.cjs", "src/proxy-bridge.cjs", "src/persona.cjs", "verify.py"):
         source = ROOT / name
         source_hashes[name] = hashlib.sha256(source.read_bytes()).hexdigest()
     context = {"browser": browser, "headless": False, "usesXvfb": use_xvfb,
@@ -165,13 +165,17 @@ def run_account(email, password, out, command, use_xvfb, url, metadata=None, sto
     payload = json.dumps(data)
     interrupted = False
     last_progress = None
+    next_progress_check = 0
     try:
         while True:
-            if on_progress:
+            if on_progress and time.monotonic() >= next_progress_check:
+                next_progress_check = time.monotonic() + 1
                 try:
-                    current_progress = (out / "progress.json").read_text()
+                    progress = json.loads((out / "progress.json").read_text())
+                    current_progress = {key: progress.get(key) for key in (
+                        "stage", "emailStatus", "passwordStatus", "exchangeCOMObserved", "requiresHumanInteraction")}
                     if current_progress != last_progress:
-                        on_progress(json.loads(current_progress))
+                        on_progress(progress)
                         last_progress = current_progress
                 except (OSError, ValueError):
                     pass

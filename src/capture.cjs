@@ -1,12 +1,16 @@
 "use strict";
 
 async function capturePage(page, filename, checkStopped = () => {}) {
+  const preparationStarted = performance.now();
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
   await page.evaluate(() => document.fonts.ready);
   let previousHeight = 0;
   for (let pass = 0; pass < 3; pass++) {
     const height = await page.evaluate(() => document.documentElement.scrollHeight);
     if (height > 50000) throw new Error("Page exceeds full screenshot height limit");
+    // The previous pass already scrolled and awaited images. Only revisit when
+    // lazy loading has changed the page height.
+    if (height === previousHeight) break;
     for (let y = 0; y < height; y += 800) {
       checkStopped();
       await page.evaluate(y => window.scrollTo(0, y), y);
@@ -17,14 +21,16 @@ async function capturePage(page, filename, checkStopped = () => {}) {
         new Promise(resolve => { img.addEventListener("load", resolve, { once: true }); img.addEventListener("error", resolve, { once: true }); }),
         new Promise(resolve => setTimeout(resolve, 5000))
       ]))));
-    if (height === previousHeight) break;
     previousHeight = height;
   }
   await page.evaluate(() => window.scrollTo(0, 0));
   await wait(500);
   checkStopped();
+  const captureStarted = performance.now();
   const png = await page.screenshot({ path: filename, fullPage: true, animations: "disabled", timeout: 30000 });
-  return { screenshotFullPage: true, screenshotWidth: png.readUInt32BE(16), screenshotHeight: png.readUInt32BE(20) };
+  return { screenshotFullPage: true, screenshotWidth: png.readUInt32BE(16), screenshotHeight: png.readUInt32BE(20),
+    screenshotPreparationMs: Math.round(captureStarted - preparationStarted),
+    screenshotCaptureMs: Math.round(performance.now() - captureStarted) };
 }
 
 async function capturePageWithRefresh(page, filename, checkStopped = () => {}, {
@@ -78,4 +84,25 @@ async function ensureAccountPageWithRefresh(page, {
   throw new Error("Authenticated account page not verified after three refreshes");
 }
 
-module.exports = { capturePage, capturePageWithRefresh, ensureAccountPageWithRefresh };
+async function captureFailurePage(page, filename, { isStopped = () => false, redactError = () => undefined } = {}) {
+  const attempts = [];
+  // Error evidence does not need another login or reload. If a full-page shot
+  // times out, try the visible error panel once in the same browser session.
+  for (const fullPage of [true, false]) {
+    if (isStopped()) return { failureScreenshotSaved: false, failureScreenshotSkipped: "cancelled", failureScreenshotAttempts: attempts };
+    const started = performance.now();
+    try {
+      await page.screenshot({ path: filename, fullPage, animations: "disabled", timeout: 10000 });
+      attempts.push({ fullPage, elapsedMs: Math.round(performance.now() - started) });
+      return { failureScreenshotSaved: true, failureScreenshotFullPage: fullPage, failureScreenshotAttempts: attempts };
+    } catch (error) {
+      attempts.push({ fullPage, elapsedMs: Math.round(performance.now() - started),
+        errorType: page.isClosed?.() ? "PageClosed" : error.name || "Error", errorMessage: redactError(error.message) });
+      if (error.name !== "TimeoutError") break;
+    }
+  }
+  return { failureScreenshotSaved: false, failureScreenshotErrorType: attempts.at(-1)?.errorType,
+    failureScreenshotErrorMessage: attempts.at(-1)?.errorMessage, failureScreenshotAttempts: attempts };
+}
+
+module.exports = { capturePage, capturePageWithRefresh, ensureAccountPageWithRefresh, captureFailurePage };

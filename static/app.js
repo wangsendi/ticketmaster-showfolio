@@ -7,6 +7,7 @@ const state = { batches: [], batch: null, runs: [], filter: "all", page: 1, deta
 const statusNames = { draft: "待开始", pending: "等待查询", running: "查询中", success: "已完成", partial: "结果不完整", failed: "查询失败", "needs-human": "需人工验证", cancelled: "已停止", interrupted: "已中断", complete: "已结束" };
 const stageNames = { refresh_proxies: "更新代理名单", wait_proxy: "等待空闲出口 IP", wait_start: "等待启动浏览器", retry_queued: "等待重试", retry_wait: "等待更换代理重试", setup: "准备代理", service: "查询服务异常", launch: "启动浏览器", proxy_setup: "连接代理", campaign: "打开活动", official_sign_in: "打开登录", wait_email: "等待邮箱页面", wait_recaptcha_before_email: "等待验证加载", email_once: "提交邮箱", password_once: "提交密码", wait_recaptcha_initialization: "等待验证加载", wait_exchange: "等待登录回调", wait_com_return: "返回活动页面", readonly_com_fan: "读取报名记录", capture_page: "生成整页截图", refresh_account_page: "刷新活动页面并核验登录", browser_driver: "浏览器驱动崩溃", browser_process: "浏览器进程异常", complete: "查询结束", runner: "查询进程异常", timeout: "查询超时" };
 const esc = value => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+Object.assign(stageNames, { dismiss_passkey: "暂不添加 Passkey", wait_email_submit: "等待邮箱按钮可点击", wait_password_submit: "等待密码按钮可点击", export_session: "导出登录会话", close_context: "保存 HAR 并关闭页面", close_browser: "关闭浏览器", collect_result: "核验并整理查询结果", save_result: "保存查询结果" });
 const date = value => value ? new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }) : "—";
 const badge = status => `<span class="badge ${esc(status)}">${esc(statusNames[status] || status)}</span>`;
 let toastTimer;
@@ -190,8 +191,24 @@ async function openDetail(id) {
   if (data.attempt_count) fields.push(["尝试次数", `${data.attempt_count}`]);
   if (result.proxyNode?.screening?.exitIP) fields.push(["出口 IP（筛选时）", result.proxyNode.screening.exitIP]);
   if (result.proxyReputation) fields.push(["代理信誉（本次结束时）", `${result.proxyReputation.confidence} / 10`]);
-  if (result.errorType) fields.push(["异常类型", result.errorType]);
+  const signInError = (result.responses || []).filter(item => item.path === "/json/sign-in" && item.businessError?.message).at(-1)?.businessError;
+  if (signInError) fields.push(["网站返回", signInError.message]);
+  if (result.errorType && !(result.errorType === "Error" && (result.credentialsRejected || result.accountIssue))) fields.push(["异常类型", result.errorType]);
+  if (!data.has_screenshot && !["pending", "running"].includes(data.status)) {
+    fields.push(["截图状态", result.failureScreenshotErrorType === "TimeoutError" ? "错误页面截图超时，未保存" : result.failureScreenshotErrorType === "PageClosed" ? "截图时页面已关闭，未保存" : result.failureScreenshotErrorType ? `截图失败（${result.failureScreenshotErrorType}）` : "未保存；该记录没有截图失败详情"]);
+  }
   if (result.lastStage) fields.push(["崩溃前阶段", stageNames[result.lastStage] || result.lastStage]);
+  if (result.optionalPasskey) {
+    const dismissal = result.passkeyDismissal;
+    fields.push(["暂不添加 Passkey", dismissal ? `${dismissal.attempts.filter(item => item.clicked).length} 次点击成功 / ${dismissal.attempts.length} 次尝试；${dismissal.completed ? "已收到登录回调" : "尚未收到登录回调"}` : "历史记录未保留点击详情"]);
+  }
+  const seconds = ms => Number.isFinite(ms) ? `${(ms / 1000).toFixed(1)} 秒` : "—";
+  if (Number.isFinite(result.screenshotPreparationMs)) fields.push(["截图准备 / 保存", `${seconds(result.screenshotPreparationMs)} / ${seconds(result.screenshotCaptureMs)}`]);
+  const phases = result.phaseDurationsMs || {};
+  for (const [key, label] of [["sessionExport", "会话导出耗时"], ["contextClose", "HAR 收尾耗时"], ["browserClose", "浏览器关闭耗时"]]) {
+    if (Number.isFinite(phases[key])) fields.push([label, seconds(phases[key])]);
+  }
+  if (Number.isFinite(result.processingTimingsMs?.resultCollection)) fields.push(["结果核验耗时", seconds(result.processingTimingsMs.resultCollection)]);
   $("detail-metadata").innerHTML = fields.map(([label,value])=>`<dt>${esc(label)}</dt><dd>${esc(value)}</dd>`).join("");
   $("detail-error").textContent = data.error || "";
   $("detail-error").hidden = !data.error;
@@ -199,7 +216,8 @@ async function openDetail(id) {
   $("download-shot").hidden = !data.has_screenshot;
   $("download-shot").href = `/api/runs/${id}/screenshot?download=1`;
   $("screenshot-kind").textContent = !data.has_screenshot ? "" : result.accountIssue ? "账号异常页面" : result.credentialsRejected ? "账号密码错误页面" : result.verificationRequirement ? "验证要求页面" : data.screenshot_kind === "full-page" ? `整页长截图${result.screenshotHeight ? ` · ${result.screenshotWidth} × ${result.screenshotHeight}` : ""}` : data.screenshot_kind === "legacy-viewport" ? "历史截图 · 仅包含当时第一屏" : "失败时页面";
-  $("screenshot-content").innerHTML = data.has_screenshot ? `<a href="/api/runs/${id}/screenshot" target="_blank" rel="noopener" aria-label="打开原始页面截图"><img src="/api/runs/${id}/screenshot" alt="${esc(data.email)} 的查询页面截图"></a>` : '<div class="empty-state"><h3>暂无页面截图</h3><p>完成查询后，整页截图会出现在这里。</p></div>';
+  const screenshotNote = ["pending", "running"].includes(data.status) ? "完成查询后，整页截图会出现在这里。" : "本次查询没有保存页面截图，具体情况见上方查询信息。";
+  $("screenshot-content").innerHTML = data.has_screenshot ? `<a href="/api/runs/${id}/screenshot" target="_blank" rel="noopener" aria-label="打开原始页面截图"><img src="/api/runs/${id}/screenshot" alt="${esc(data.email)} 的查询页面截图"></a>` : `<div class="empty-state"><h3>暂无页面截图</h3><p>${esc(screenshotNote)}</p></div>`;
   if (!$("detail-dialog").open) $("detail-dialog").showModal();
 }
 function readCount(id, optional = false) {

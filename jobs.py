@@ -329,10 +329,18 @@ class QueryService:
                             with tempfile.TemporaryDirectory(prefix="tm-query-") as temporary:
                                 out = Path(temporary) / "browser"
                                 try:
+                                    browser_started = time.monotonic()
                                     summary = self.execute(account["email"], account["password"], out, command, xvfb, batch["campaign"],
                                                            proxy=proxy, stop_event=event,
                                                            on_progress=lambda value: self.store.progress(run_id, value))
+                                    browser_ms = round((time.monotonic() - browser_started) * 1000)
+                                    self.store.progress(run_id, {**summary, "stage":"collect_result"})
+                                    collect_started = time.monotonic()
                                     data = collect(out, account["email"], summary)
+                                    data["result"]["processingTimingsMs"] = {
+                                        "browserProcess": browser_ms,
+                                        "resultCollection": round((time.monotonic() - collect_started) * 1000),
+                                    }
                                 except sqlite3.Error:
                                     raise
                                 except Exception:
@@ -373,9 +381,12 @@ class QueryService:
                     if data["status"] not in ("failed", "partial") or attempts == MAX_ATTEMPTS:
                         break
                     self.store.progress(run_id, {"stage":"retry_wait"})
+                if isinstance(data["result"].get("attempts"), dict):
+                    data["result"]["loginAttempts"] = data["result"]["attempts"]
                 data["result"].update(attempts=attempts, maxAttempts=MAX_ATTEMPTS)
                 if previous is not None:
                     previous_proxies[run_id] = previous
+                self.store.progress(run_id, {**data["result"], "stage":"save_result"})
                 self.store.finish_run(run_id, data)
                 return run_id if data["status"] in ("failed", "partial") else None
 
