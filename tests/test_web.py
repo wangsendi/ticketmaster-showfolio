@@ -40,10 +40,40 @@ class AccountImportTests(unittest.TestCase):
     def test_tsv_comments_headers_and_duplicates(self):
         rows = parse_accounts(b"# comment\nemail\tpassword\nfirst@example.invalid\t pass \n", "a.txt")
         self.assertEqual((rows[0].source_line, rows[0].password), (3, " pass "))
-        for data in (b"first@example.invalid\tsecret\nFIRST@example.invalid\tsecret", b"broken secret"):
-            with self.assertRaises(ValueError) as error:
-                parse_accounts(data, "a.tsv")
-            self.assertNotIn("secret", str(error.exception))
+        imported = parse_import(b"first@example.invalid\tsecret\nFIRST@example.invalid\tother\nthird@example.invalid\tsecret", "a.tsv")
+        self.assertEqual([a.email for a in imported.accounts], ["first@example.invalid", "third@example.invalid"])
+        self.assertEqual(imported.accounts[0].password, "secret")
+        self.assertEqual(imported.duplicate_count, 1)
+        with self.assertRaises(ValueError) as error:
+            parse_accounts(b"broken secret", "a.tsv")
+        self.assertNotIn("secret", str(error.exception))
+
+    def test_duplicate_rows_skip_unused_password_validation_in_csv_and_excel(self):
+        rows = [["email", "password"], ["first@example.invalid", " original-secret "],
+                [" FIRST@example.invalid ", ""], ["first@example.invalid"],
+                ["first@example.invalid", "=1+1"], ["second@example.invalid", "next-secret"]]
+        text = io.StringIO(newline="")
+        csv.writer(text).writerows(rows)
+        from openpyxl import Workbook
+        book = Workbook()
+        for row in rows:
+            book.active.append(row)
+        output = io.BytesIO(); book.save(output); book.close()
+        for name, data in (("duplicates.csv", text.getvalue().encode()), ("duplicates.xlsx", output.getvalue())):
+            with self.subTest(name=name):
+                imported = parse_import(data, name)
+                self.assertEqual(imported.duplicate_count, 3)
+                self.assertEqual([account.source_line for account in imported.accounts], [2, 6])
+                self.assertEqual(imported.accounts[0].password, " original-secret ")
+
+    def test_duplicates_do_not_consume_import_limit_and_are_counted_after_limit(self):
+        data = ("email,password,status\nfirst@example.invalid,first,\nFIRST@example.invalid,,\n"
+                "second@example.invalid,second,\n first@example.invalid ,,\n"
+                "third@example.invalid,third,\nTHIRD@example.invalid,,\n"
+                "done@example.invalid,,success\n").encode()
+        imported = parse_import(data, "duplicates.csv", max_accounts=2)
+        self.assertEqual([account.email for account in imported.accounts], ["first@example.invalid", "second@example.invalid"])
+        self.assertEqual((imported.duplicate_count, imported.deferred_count, imported.skipped_count), (3, 1, 1))
 
     def test_excel_headers_reordered_and_numeric_password_rejected(self):
         from openpyxl import Workbook
@@ -332,11 +362,19 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.store.path.stat().st_mode & 0o777, 0o600)
 
     def test_invalid_upload_is_atomic_and_post_requires_token(self):
-        response = self.upload(b"email,password\nfirst@example.invalid,a\nfirst@example.invalid,b\n")
+        response = self.upload(b"email,password\nbroken-mail,a\n")
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.store.batches(), [])
         self.assertEqual(self.client.post("/api/import").status_code, 403)
         self.assertEqual(self.client.get("/api/runs/999").status_code, 404)
+
+    def test_upload_deduplicates_repeated_accounts(self):
+        response = self.upload(b"email,password\nfirst@example.invalid,a\nFIRST@example.invalid,b\n")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json["duplicates"], 1)
+        rows = self.store.runs(response.json["id"])
+        self.assertEqual([r["email"] for r in rows], ["first@example.invalid"])
+        self.assertEqual(self.store.run(rows[0]["id"])["password"], "a")
 
     def test_api_proxy_filter_routes_to_cached_json_without_external_probes(self):
         service = self.app.extensions["queries"]
@@ -407,7 +445,7 @@ class WebTests(unittest.TestCase):
     def test_all_success_upload_does_not_create_an_empty_batch(self):
         response = self.upload(b"email,password,status\nfirst@example.invalid,,success\nsecond@example.invalid,, SUCCESS \n")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json, {"id":None, "count":0, "skipped":2, "deferred":0})
+        self.assertEqual(response.json, {"id":None, "count":0, "skipped":2, "deferred":0, "duplicates":0})
         self.assertEqual(self.store.batches(), [])
 
     def test_exported_excel_can_be_reuploaded_and_skips_successful_accounts(self):

@@ -127,10 +127,12 @@ def create_app(database=None, service_options=None, recover=False):
         max_accounts = positive_count(request.form.get("max_accounts"), "账号数量", optional=True)
         campaign = validate_campaign(request.form.get("campaign", DEFAULT_URL).strip())
         imported = parse_import(file.read(), file.filename, max_accounts=max_accounts)
+        summary = dict(count=len(imported.accounts), skipped=imported.skipped_count,
+                       deferred=imported.deferred_count, duplicates=imported.duplicate_count)
         if not imported.accounts:
-            return jsonify(id=None, count=0, skipped=imported.skipped_count, deferred=imported.deferred_count)
+            return jsonify(id=None, **summary)
         batch_id = store.create_batch(imported.accounts, Path(file.filename).name[:160], campaign, concurrency)
-        return jsonify(id=batch_id, count=len(imported.accounts), skipped=imported.skipped_count, deferred=imported.deferred_count), 201
+        return jsonify(id=batch_id, **summary), 201
 
     @app.get("/api/batches/<int:batch_id>")
     def batch(batch_id):

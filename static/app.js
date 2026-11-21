@@ -252,8 +252,10 @@ $("import-form").addEventListener("submit", async event => {
     const data = await api("/api/import", { method: "POST", body: form });
     const skipped = data.skipped || 0;
     const deferred = data.deferred || 0;
+    const duplicates = data.duplicates || 0;
+    const deduped = duplicates ? `，跳过 ${duplicates} 条重复记录` : "";
     const message = data.count
-      ? `已导入 ${data.count} 个账号${skipped ? `，跳过 ${skipped} 个已成功或需人工验证的账号` : ""}${deferred ? `，${deferred} 个超出本次数量未导入` : ""}。点击“开始查询”运行。`
+      ? `已导入 ${data.count} 个账号${deduped}${skipped ? `，跳过 ${skipped} 个已成功或需人工验证的账号` : ""}${deferred ? `，${deferred} 个超出本次数量未导入` : ""}。点击“开始查询”运行。`
       : `已跳过 ${skipped} 个已成功或需人工验证的账号，本次没有需要查询的账号，未创建新批次。`;
     if (data.id) await refresh(data.id);
     $("import-notice").textContent = message;

@@ -19,6 +19,7 @@ class AccountImport:
     accounts: list[Account] = field(repr=False)
     skipped_count: int = 0
     deferred_count: int = 0
+    duplicate_count: int = 0
 
 
 def spreadsheet_rows(data, suffix):
@@ -65,7 +66,7 @@ def parse_import(data, filename, *, skip_success=True, max_accounts=None):
     accounts, seen = [], set()
     columns = None
     status_column = None
-    skipped = deferred = 0
+    skipped = deferred = duplicates = 0
     with closing(spreadsheet_rows(data, suffix)) as rows:
         for number, (row, has_formula) in enumerate(rows, 1):
             if not row or all(value in (None, "") for value in row):
@@ -88,8 +89,15 @@ def parse_import(data, filename, *, skip_success=True, max_accounts=None):
                 if isinstance(status, str) and status.strip().casefold() in ("success", "已完成", "成功", "needs-human", "需人工验证", "需要人工验证"):
                     skipped += 1
                     continue
+            email_value = row[columns[0]] if columns[0] < len(row) else None
+            account_key = email_value.strip().casefold() if isinstance(email_value, str) else None
+            if account_key and account_key in seen:
+                duplicates += 1
+                continue
             if max_accounts is not None and len(accounts) >= max_accounts:
                 deferred += 1
+                if account_key:
+                    seen.add(account_key)
                 continue
             if has_formula:
                 raise ValueError(f"第 {number} 行包含公式，请先粘贴为文本。")
@@ -103,13 +111,11 @@ def parse_import(data, filename, *, skip_success=True, max_accounts=None):
                 raise ValueError(f"第 {number} 行邮箱格式错误或密码为空。")
             if len(email) > 320 or len(password) > 1024:
                 raise ValueError(f"第 {number} 行字段过长。")
-            if email.casefold() in seen:
-                raise ValueError(f"第 {number} 行账号重复，请保留一条。")
             seen.add(email.casefold())
             accounts.append(Account(number, email, password))
     if not accounts and not skipped:
         raise ValueError("表格里没有账号。")
-    return AccountImport(accounts, skipped, deferred)
+    return AccountImport(accounts, skipped_count=skipped, deferred_count=deferred, duplicate_count=duplicates)
 
 
 def parse_accounts(data, filename, *, skip_success=True, max_accounts=None):
